@@ -1,0 +1,34 @@
+MEMORANDUM
+
+TO:       Supervising Attorney
+FROM:     Paralegal — JurisLPO
+RE:       Sample memo for citation-verification testing
+DATE:     1 May 2026
+
+This memo is a deliberately mixed sample used to exercise the
+juris-citation-verify tool. It contains real cases, fabricated cases,
+short-form references, an Id. citation, and a typo'd reporter.
+
+I.  Equal Protection — Public Education
+
+The seminal authority is Plyler v. Doe, 457 U.S. 202, 230 (1982),
+which held that states cannot deny public education to undocumented
+children. See also Plyler, 457 U.S. at 215 (discussing the Equal
+Protection Clause). The Court emphasized fundamental rights. Id. at 221.
+
+II. AI-Hallucinated Citations — Cautionary Authority
+
+In Mata v. Avianca, Inc., 22-cv-1461 (S.D.N.Y. 2023), the court
+sanctioned attorneys for submitting briefs with AI-fabricated case
+citations. (Note: docket-style federal citation; eyecite does not
+parse these without a reporter.)
+
+III. Foundational Equal-Protection Authority
+
+Compare with Brown v. Board of Education, 347 U.S. 483 (1954) and
+the apocryphal Smith v. Imaginary, 999 U.S. 9999 (2099) — the latter
+is a deliberately fabricated citation that should not exist anywhere.
+
+IV. Reporter Normalisation Test
+
+Note also 576 US 644 (typo'd reporter — should normalise to "U.S.").

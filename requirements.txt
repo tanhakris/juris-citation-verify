@@ -1,0 +1,6 @@
+# Pinned to versions that work across Python 3.9 → 3.13.
+# If you have Python 3.10+, you can bump eyecite to >=2.6 for newer features
+# (better short-form / supra resolution).
+requests>=2.31
+eyecite>=2.5,<3
+rich>=13.7

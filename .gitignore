@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.html
+*.json
+.DS_Store
+.vscode/launch.json.bak
+
+# Stray broken venvs from accidental `python -m venv` invocations
+/#/
+/Python/
+/explicitly/
+/modern/
+/the/
+/use/
