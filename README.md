@@ -55,13 +55,55 @@ open report.html                     # macOS — opens in browser
 
 ---
 
+## Two modes
+
+`verify.py` has two distinct modes.
+
+| | **Verification** (default) | **Case extraction** (`--extract`) |
+|---|---|---|
+| What it does | Runs all five verification stages (reachability, anonymous audit, practice-area coverage, Eyecite local, hybrid hallucination detector) | Looks up *one* case by citation and dumps its full detail |
+| Trigger | No `--extract` flag | `--extract "<citation>"` |
+| Network | Optional (`--no-net` skips it) | Required (`--no-net` rejected) |
+| Anon CourtListener | All five stages run; the audit reports which endpoints are gated | Returns case name, citations, court, dates, judge, docket, status, URL, syllabus |
+| Authenticated CourtListener | Same five stages, faster + more endpoints accessible | Adds full majority opinion + concurrences + dissents (typically tens of thousands of words) |
+| Outputs | `--html` audit report, `--json` raw results | `--html` case page, `--text` plain-text dump, `--json` machine-readable case |
+| Exit codes | `0` success, `1` failure | `0` success, `2` parse error, `3` case not found |
+
+### Examples — case extraction
+
+```bash
+# Anonymous (metadata + syllabus only)
+python verify.py --extract "576 U.S. 644"                    # Obergefell v. Hodges
+python verify.py --extract "347 U.S. 483"                    # Brown v. Board of Education
+python verify.py --extract "457 U.S. 202"                    # Plyler v. Doe
+
+# Three exports in one call (HTML, plain text, JSON)
+python verify.py --extract "576 U.S. 644" \
+    --html /tmp/obergefell.html \
+    --text /tmp/obergefell.txt \
+    --json /tmp/obergefell.json
+
+# Authenticated — same command, full opinion text
+export CL_TOKEN=your-token-here
+python verify.py --extract "576 U.S. 644" --html /tmp/obergefell_full.html
+```
+
+Get a free CourtListener token at <https://www.courtlistener.com/help/api/rest/>.
+The HTML output is a single self-contained file (embedded CSS, no JS) and
+opens in any browser — share it with non-technical stakeholders.
+
+---
+
 ## CLI flags
 
 ```
 python verify.py [OPTIONS]
 
-  --html PATH          Write standalone HTML report to PATH
-  --json PATH          Write raw JSON results to PATH
+  --extract CITATION   Case-extraction mode. Look up one case by citation
+                       and dump full case detail (skips verification stages).
+  --html PATH          Write standalone HTML (audit report or case page)
+  --json PATH          Write raw JSON (audit results or case data)
+  --text PATH          (--extract only) Write plain-text case dump (90 cols)
   --memo PATH          Use a custom .txt memo for Eyecite extraction
   --no-net             Skip all network tests (Eyecite-only run)
   --quick              Skip the slow practice-area coverage test
