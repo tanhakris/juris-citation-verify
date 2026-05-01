@@ -12,18 +12,25 @@ every test from the [JurisLPO Live Verification Report](../CourtListener_Live_Ve
 
 ---
 
-## What it tests
+## What it does
 
-| Stage | What it checks |
+One command runs the entire pipeline end-to-end:
+
+| Stage | What it does |
 |------|----------------|
-| 1 · Reachability        | Is the CourtListener REST API live and serving JSON? |
+| 1 · Reachability         | Is the CourtListener REST API live and serving JSON? |
 | 2 · Anonymous audit      | Which endpoints work without an API token; which require auth |
-| 3 · Practice-area cover. | One landmark SCOTUS case from each of our six curriculum tracks |
-| 4 · Eyecite local       | Pure-local citation extraction from a sample memo (no network) |
-| 5 · Hybrid detector      | Eyecite + CourtListener Search → pass/fail on real and fake citations |
+| 3 · Practice-area cover. | One landmark SCOTUS case from each of our six curriculum tracks (skip with `--quick`) |
+| 4 · Memo analysis        | Eyecite parses the memo. For each full citation, search CourtListener and tag a verdict: ✅ verified, 🚨 hallucinated, or ⚠️ unparseable. With `CL_TOKEN`, additionally pull the full majority + concurrences + dissents. |
+
+`--html report.html` produces a single self-contained file containing
+system health + the per-citation verdict table + a per-case detail card
+for every verified citation. Open it in a browser; it has embedded CSS,
+no JS, no external resources.
 
 The tool runs anonymously by default. Set the `CL_TOKEN` environment variable
-to switch to authenticated mode (faster, more reliable, higher rate limits).
+to switch to authenticated mode (full opinion text + faster lookups + higher
+rate limits).
 
 ---
 
@@ -47,50 +54,48 @@ source .venv/bin/activate            # macOS/Linux
 # 3. Install dependencies
 pip install -r requirements.txt
 
-# 4. Run
-python verify.py                     # console-only
-python verify.py --html report.html  # also generate HTML report
+# 4. Run — one command, one report
+python verify.py --html report.html --memo sample_memo.txt
 open report.html                     # macOS — opens in browser
 ```
 
 ---
 
-## Two modes
+## What you get
 
-`verify.py` has two distinct modes.
+The HTML report has four sections, in order:
 
-| | **Verification** (default) | **Case extraction** (`--extract`) |
-|---|---|---|
-| What it does | Runs all five verification stages (reachability, anonymous audit, practice-area coverage, Eyecite local, hybrid hallucination detector) | Looks up *one* case by citation and dumps its full detail |
-| Trigger | No `--extract` flag | `--extract "<citation>"` |
-| Network | Optional (`--no-net` skips it) | Required (`--no-net` rejected) |
-| Anon CourtListener | All five stages run; the audit reports which endpoints are gated | Returns case name, citations, court, dates, judge, docket, status, URL, syllabus |
-| Authenticated CourtListener | Same five stages, faster + more endpoints accessible | Adds full majority opinion + concurrences + dissents (typically tens of thousands of words) |
-| Outputs | `--html` audit report, `--json` raw results | `--html` case page, `--text` plain-text dump, `--json` machine-readable case |
-| Exit codes | `0` success, `1` failure | `0` success, `2` parse error, `3` case not found |
+1. **Hero header** — three big stat boxes: total citations parsed, ✅ verified,
+   🚨 hallucinated. Hallucinated count goes red when > 0.
+2. **System health** — reachability, anonymous-vs-authenticated endpoint matrix,
+   practice-area coverage tables.
+3. **Memo analysis** — every full citation Eyecite found, with a verdict pill
+   and a link to its detail card.
+4. **Verified cases** — for each verified citation, a card with case name,
+   parallel citations, court, decided date, judges, docket, status,
+   syllabus, and (with `CL_TOKEN`) full majority + concurrences + dissents.
 
-### Examples — case extraction
+### Examples
 
 ```bash
-# Anonymous (metadata + syllabus only)
-python verify.py --extract "576 U.S. 644"                    # Obergefell v. Hodges
-python verify.py --extract "347 U.S. 483"                    # Brown v. Board of Education
-python verify.py --extract "457 U.S. 202"                    # Plyler v. Doe
+# Default flow on the bundled memo
+python verify.py --html /tmp/r.html
 
-# Three exports in one call (HTML, plain text, JSON)
-python verify.py --extract "576 U.S. 644" \
-    --html /tmp/obergefell.html \
-    --text /tmp/obergefell.txt \
-    --json /tmp/obergefell.json
+# Skip the slow practice-area stage
+python verify.py --quick --html /tmp/r.html
 
-# Authenticated — same command, full opinion text
+# Eyecite only, no CourtListener (each citation tagged "skipped")
+python verify.py --no-net --memo sample_memo.txt
+
+# Custom memo
+python verify.py --html /tmp/r.html --memo /path/to/my_memo.txt
+
+# Authenticated — full majority opinion + dissents per verified case
 export CL_TOKEN=your-token-here
-python verify.py --extract "576 U.S. 644" --html /tmp/obergefell_full.html
+python verify.py --html /tmp/r.html
 ```
 
 Get a free CourtListener token at <https://www.courtlistener.com/help/api/rest/>.
-The HTML output is a single self-contained file (embedded CSS, no JS) and
-opens in any browser — share it with non-technical stakeholders.
 
 ---
 
@@ -99,14 +104,11 @@ opens in any browser — share it with non-technical stakeholders.
 ```
 python verify.py [OPTIONS]
 
-  --extract CITATION   Case-extraction mode. Look up one case by citation
-                       and dump full case detail (skips verification stages).
-  --html PATH          Write standalone HTML (audit report or case page)
-  --json PATH          Write raw JSON (audit results or case data)
-  --text PATH          (--extract only) Write plain-text case dump (90 cols)
-  --memo PATH          Use a custom .txt memo for Eyecite extraction
-  --no-net             Skip all network tests (Eyecite-only run)
-  --quick              Skip the slow practice-area coverage test
+  --html PATH          Write the unified HTML report
+  --json PATH          Write raw JSON (full report including memo analysis)
+  --memo PATH          Use a custom .txt memo (default: sample_memo.txt)
+  --no-net             Skip all network calls (Eyecite-only, citations tagged "skipped")
+  --quick              Skip the slow practice-area coverage stage
   -h, --help           Show help and exit
 ```
 

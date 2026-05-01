@@ -8,22 +8,20 @@ citation parser, end-to-end, on your local machine.
 Designed for JurisLPO / Tech House AI hallucination-detection due diligence.
 Reproduces every test from the live verification report.
 
-Two modes
----------
-1. **Verification** (default) — runs five stages, prints a verification report.
-2. **Case extraction** (`--extract CITATION`) — pulls one case end-to-end and
-   renders its metadata, syllabus, and (with auth) full opinion text.
+One command, one report
+-----------------------
+The default flow runs system health checks, Eyecite-parses a memo, verifies
+each FullCaseCitation against CourtListener, and renders everything in a
+single console output and (optionally) a single HTML report.
 
 Usage
 -----
-    python verify.py                                  # verification, console only
-    python verify.py --html report.html               # verification + HTML report
-    python verify.py --no-net                         # eyecite-only verification
+    python verify.py                                  # console output only
+    python verify.py --html report.html               # console + unified HTML
+    python verify.py --memo my_memo.txt --html r.html # custom memo
+    python verify.py --no-net --memo sample_memo.txt  # eyecite-only (no CL)
     python verify.py --quick                          # skip practice-area stage
-    python verify.py --extract "576 U.S. 644"         # case extraction
-    python verify.py --extract "576 U.S. 644" \\
-        --html case.html --text case.txt --json case.json
-    CL_TOKEN=xxxxx python verify.py --extract ...     # auth = full opinion text
+    CL_TOKEN=xxxxx python verify.py --html r.html     # auth = full opinion text
 
 Author : Gopal | JurisConsultants Group
 License: MIT
@@ -143,6 +141,7 @@ class Opinion:
 @dataclass
 class Case:
     queried_citation: str
+    verdict: str = "verified_real"  # verified_real | hallucinated | unparseable | skipped
     case_name: str = ""
     case_name_full: str = ""
     citations: list[str] = field(default_factory=list)
@@ -165,6 +164,18 @@ class Case:
 
 
 @dataclass
+class MemoAnalysis:
+    memo_path: str
+    auth_mode: str
+    total_citations: int = 0
+    verified: int = 0
+    hallucinated: int = 0
+    unparseable: int = 0
+    skipped: int = 0
+    cases: list[Case] = field(default_factory=list)
+
+
+@dataclass
 class Report:
     started_at: str
     finished_at: str = ""
@@ -172,14 +183,10 @@ class Report:
     eyecite_version: str = ""
     results: list[TestResult] = field(default_factory=list)
     practice_area_results: list[dict] = field(default_factory=list)
-    eyecite_extractions: list[dict] = field(default_factory=list)
-    hybrid_detector: list[dict] = field(default_factory=list)
+    memo_analysis: MemoAnalysis | None = None
 
     def to_dict(self) -> dict:
-        return {
-            **{k: v for k, v in asdict(self).items() if k != "results"},
-            "results": [asdict(r) for r in self.results],
-        }
+        return asdict(self)
 
 
 # CourtListener opinion-type codes (preserves the upstream "015unamimous" typo)
@@ -353,122 +360,6 @@ def stage_practice_areas(report: Report) -> None:
         console.print(t)
 
 
-def stage_eyecite_local(report: Report, memo_path: Path | None) -> None:
-    banner("Stage 4 · Eyecite local extraction (no network)")
-    text = memo_path.read_text() if memo_path and memo_path.exists() else DEFAULT_TEST_MEMO
-    cleaned = clean_text(text, ["html", "inline_whitespace"])
-
-    t0 = time.time()
-    citations = get_citations(cleaned)
-    elapsed = (time.time() - t0) * 1000
-
-    say(f"Parsed {len(citations)} citations in {elapsed:.1f} ms ({len(text)} chars input)", "pass")
-
-    if RICH:
-        t = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan")
-        t.add_column("#", width=4)
-        t.add_column("Type", width=20)
-        t.add_column("Matched text", width=24)
-        t.add_column("Reporter", width=14)
-        t.add_column("Parties / metadata", width=40, overflow="ellipsis")
-
-    for i, c in enumerate(citations, 1):
-        cls = type(c).__name__
-        matched = c.matched_text() if hasattr(c, "matched_text") else str(c)
-        reporter = ""
-        meta_str = ""
-        if isinstance(c, FullCaseCitation):
-            reporter = c.groups.get("reporter", "")
-            md = c.metadata
-            if md:
-                parties = ""
-                if hasattr(md, "plaintiff") and md.plaintiff:
-                    parties = f"{md.plaintiff} v. {md.defendant or '?'}"
-                year = getattr(md, "year", "") or ""
-                court = getattr(md, "court", "") or ""
-                meta_str = f"{parties} ({year}, {court})".strip(", ()")
-        report.eyecite_extractions.append(
-            {"i": i, "type": cls, "matched": matched, "reporter": reporter, "meta": meta_str}
-        )
-        if RICH:
-            t.add_row(str(i), cls, matched, reporter, meta_str)
-        else:
-            print(f"  [{i}] {cls:20s} '{matched}' rep={reporter} | {meta_str}")
-    if RICH:
-        console.print(t)
-    report.results.append(
-        TestResult("eyecite_local_parse", "pass", f"{len(citations)} citations", elapsed)
-    )
-
-
-def stage_hybrid_detector(report: Report) -> None:
-    banner("Stage 5 · Hybrid hallucination detector (Eyecite + CL Search)")
-    say("Real cases should return ≥1 hit; fake cases should return 0.", "info")
-
-    if RICH:
-        t = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan")
-        t.add_column("Citation", width=18)
-        t.add_column("Expected", width=12)
-        t.add_column("Hits", justify="right", width=8)
-        t.add_column("Verdict", width=14)
-        t.add_column("Latency", justify="right", width=10)
-
-    for vol, rep, pg in KNOWN_REAL + KNOWN_FAKE:
-        cite_str = f"{vol} {rep} {pg}"
-        is_known_real = (vol, rep, pg) in KNOWN_REAL
-        params = {"q": f'"{cite_str}"', "type": "o"}
-        code, body, ms = http("GET", "/search/", params=params)
-        if code != 200 or not isinstance(body, dict):
-            verdict = "ERROR"
-            hits = 0
-        else:
-            hits = body.get("count", 0)
-            if hits == 0:
-                verdict = "🚨 FAKE"
-            else:
-                verdict = "✅ REAL"
-        correct = (
-            (is_known_real and hits > 0)
-            or ((not is_known_real) and hits == 0)
-        )
-        report.hybrid_detector.append(
-            {
-                "citation": cite_str,
-                "expected": "real" if is_known_real else "fake",
-                "hits": hits,
-                "verdict": verdict,
-                "latency_ms": ms,
-                "correct": correct,
-            }
-        )
-        if RICH:
-            t.add_row(
-                cite_str,
-                "real" if is_known_real else "fake",
-                str(hits),
-                f"[{'green' if correct else 'red'}]{verdict}[/]",
-                f"{ms:.0f} ms",
-            )
-        else:
-            print(f"  {cite_str:18s} exp={'real' if is_known_real else 'fake':5s} hits={hits} {verdict}")
-        time.sleep(0.5)
-    if RICH:
-        console.print(t)
-
-    correct_count = sum(1 for r in report.hybrid_detector if r["correct"])
-    total = len(report.hybrid_detector)
-    status = "pass" if correct_count == total else "warn"
-    say(f"Detector accuracy: {correct_count}/{total} correct", status)
-    report.results.append(
-        TestResult(
-            "hybrid_detector_accuracy",
-            status,
-            f"{correct_count}/{total}",
-            extra={"per_test": report.hybrid_detector},
-        )
-    )
-
-
 # ---------------------------------------------------------------------------
 # Case extraction — workflow + helpers
 # ---------------------------------------------------------------------------
@@ -635,18 +526,28 @@ def _fetch_sub_opinions(case: Case, sub_urls: list[str]) -> None:
         time.sleep(0.2)
 
 
-def extract_case(citation_str: str) -> Case:
-    """Resolve a citation to a Case. Raises CaseNotFound / CaseUnparseable."""
-    cleaned = clean_text(citation_str, ["html", "inline_whitespace"])
-    parsed = [c for c in get_citations(cleaned) if isinstance(c, FullCaseCitation)]
-    if not parsed:
-        raise CaseUnparseable(citation_str)
-    fc = parsed[0]
-    canonical = (
-        f"{fc.groups.get('volume', '')} "
-        f"{fc.groups.get('reporter', '')} "
-        f"{fc.groups.get('page', '')}"
-    ).strip()
+def extract_case(
+    citation_str: str,
+    eyecite_match: FullCaseCitation | None = None,
+) -> Case:
+    """Resolve a citation to a Case. Always returns a Case with `.verdict` set.
+
+    `eyecite_match` may be supplied to skip re-parsing — used by
+    stage_memo_analysis which has already parsed the memo.
+    """
+    if eyecite_match is None:
+        cleaned = clean_text(citation_str, ["html", "inline_whitespace"])
+        parsed = [c for c in get_citations(cleaned) if isinstance(c, FullCaseCitation)]
+        if not parsed:
+            return Case(queried_citation=citation_str, verdict="unparseable")
+        eyecite_match = parsed[0]
+
+    vol = eyecite_match.groups.get("volume", "") or ""
+    rep = eyecite_match.groups.get("reporter", "") or ""
+    pg = eyecite_match.groups.get("page", "") or ""
+    canonical = f"{vol} {rep} {pg}".strip()
+    if not (vol and rep and pg):
+        return Case(queried_citation=citation_str, verdict="unparseable")
 
     # order_by=dateFiled asc puts the case being cited near the top: any
     # opinion that cites X was filed *after* X. Without this, common citations
@@ -662,13 +563,14 @@ def extract_case(citation_str: str) -> Case:
         },
     )
     if code != 200 or not isinstance(body, dict):
-        raise CaseNotFound(canonical)
+        return Case(queried_citation=canonical, verdict="hallucinated")
     match = _pick_cluster_from_search(canonical, body.get("results") or [])
     if match is None:
-        raise CaseNotFound(canonical)
+        return Case(queried_citation=canonical, verdict="hallucinated")
 
     case = Case(
         queried_citation=canonical,
+        verdict="verified_real",
         case_name=match.get("caseName") or match.get("caseNameFull") or "",
         case_name_full=match.get("caseNameFull") or "",
         citations=[c for c in (match.get("citation") or []) if c],
@@ -702,12 +604,102 @@ def extract_case(citation_str: str) -> Case:
     return case
 
 
-class CaseUnparseable(Exception):
-    """Eyecite could not parse the input as a legal citation."""
+def stage_memo_analysis(
+    report: Report,
+    memo_path: Path | None,
+    do_network: bool,
+) -> None:
+    """Parse the memo, extract every full citation, and tag a verdict per citation.
 
+    Replaces the older stage_eyecite_local + stage_hybrid_detector duo.
+    """
+    banner("Stage 4 · Memo analysis (Eyecite + CourtListener)")
+    text = memo_path.read_text() if memo_path and memo_path.exists() else DEFAULT_TEST_MEMO
+    cleaned = clean_text(text, ["html", "inline_whitespace"])
 
-class CaseNotFound(Exception):
-    """The citation parses but no matching cluster exists in CourtListener."""
+    t0 = time.time()
+    citations = get_citations(cleaned)
+    full_cites = [c for c in citations if isinstance(c, FullCaseCitation)]
+    parse_ms = (time.time() - t0) * 1000
+
+    say(
+        f"Parsed {len(citations)} citation tokens "
+        f"({len(full_cites)} full case citations) in {parse_ms:.1f} ms "
+        f"({len(text)} chars input)",
+        "pass",
+    )
+
+    analysis = MemoAnalysis(
+        memo_path=str(memo_path) if memo_path else "(default memo)",
+        auth_mode=report.auth_mode,
+        total_citations=len(full_cites),
+    )
+
+    if not do_network:
+        say("--no-net set: skipping CourtListener lookups.", "warn")
+        for fc in full_cites:
+            vol = fc.groups.get("volume", "") or ""
+            rep = fc.groups.get("reporter", "") or ""
+            pg = fc.groups.get("page", "") or ""
+            canonical = f"{vol} {rep} {pg}".strip() or fc.matched_text()
+            analysis.cases.append(Case(queried_citation=canonical, verdict="skipped"))
+        analysis.skipped = len(full_cites)
+        report.memo_analysis = analysis
+        report.results.append(
+            TestResult("memo_analysis", "pass", f"{len(full_cites)} citations (skipped lookups)")
+        )
+        return
+
+    if RICH:
+        progress = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan")
+        progress.add_column("#", width=3)
+        progress.add_column("Citation", width=18)
+        progress.add_column("Verdict", width=18)
+        progress.add_column("Case name", width=42, overflow="ellipsis")
+
+    for i, fc in enumerate(full_cites, 1):
+        case = extract_case(fc.matched_text(), eyecite_match=fc)
+        analysis.cases.append(case)
+        if case.verdict == "verified_real":
+            analysis.verified += 1
+            verdict_label = "✅ verified_real"
+        elif case.verdict == "hallucinated":
+            analysis.hallucinated += 1
+            verdict_label = "🚨 hallucinated"
+        else:
+            analysis.unparseable += 1
+            verdict_label = "⚠️  unparseable"
+        if RICH:
+            progress.add_row(
+                str(i),
+                case.queried_citation,
+                verdict_label,
+                case.case_name or "—",
+            )
+        else:
+            print(
+                f"  [{i}] {case.queried_citation:18s} "
+                f"{verdict_label:18s} {case.case_name or '—'}"
+            )
+        time.sleep(0.2)
+
+    if RICH:
+        console.print(progress)
+
+    report.memo_analysis = analysis
+    overall = (
+        "pass"
+        if analysis.hallucinated == 0 and analysis.unparseable == 0
+        else "warn"
+    )
+    report.results.append(
+        TestResult(
+            "memo_analysis",
+            overall,
+            f"{analysis.verified}/{analysis.total_citations} verified, "
+            f"{analysis.hallucinated} hallucinated, {analysis.unparseable} unparseable",
+        )
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -717,7 +709,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>JurisLPO · Citation-Verification Report</title>
+<title>Citation Verification Report</title>
 <style>
   :root {{
     --navy: #1F3A5F;
@@ -734,75 +726,114 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     background: var(--bg); color: #1F1F1F; margin: 0; padding: 32px;
   }}
   .wrap {{ max-width: 1100px; margin: 0 auto; background: #fff;
-          padding: 40px 56px; border-radius: 8px;
-          box-shadow: 0 2px 24px rgba(0,0,0,0.06); }}
-  h1 {{ color: var(--navy); border-bottom: 3px solid var(--navy);
-       padding-bottom: 12px; margin-top: 0; }}
-  h2 {{ color: var(--blue); margin-top: 36px; }}
-  h3 {{ color: var(--navy); margin-top: 24px; font-size: 1.05em; }}
-  .meta {{ color: var(--gray); font-size: 13px; margin-bottom: 24px; }}
-  table {{ border-collapse: collapse; width: 100%; margin: 14px 0 24px;
+          border-radius: 8px; box-shadow: 0 2px 24px rgba(0,0,0,0.06);
+          overflow: hidden; }}
+  .hero {{ background: linear-gradient(135deg, var(--navy) 0%, var(--blue) 100%);
+          color: #fff; padding: 36px 56px 28px; }}
+  .hero h1 {{ margin: 0 0 6px 0; font-size: 1.85em; }}
+  .hero .meta {{ color: #cfe0f4; font-size: 13px; margin-bottom: 24px; }}
+  .stats {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; }}
+  .stat {{ background: rgba(255,255,255,0.08); border-radius: 6px;
+          padding: 18px 22px; }}
+  .stat .num {{ font-size: 2.2em; font-weight: 700; line-height: 1.1; }}
+  .stat .label {{ color: #cfe0f4; font-size: 13px; margin-top: 4px;
+                 letter-spacing: 0.02em; text-transform: uppercase; }}
+  .stat.good .num {{ color: #b6e3b6; }}
+  .stat.bad  .num {{ color: #ffb4b4; }}
+  .body-pad {{ padding: 32px 56px 8px 56px; }}
+  h2 {{ color: var(--blue); margin-top: 32px; font-size: 1.25em;
+       border-bottom: 1px solid #d8dde4; padding-bottom: 6px; }}
+  h3 {{ color: var(--navy); margin-top: 22px; font-size: 1.05em; }}
+  .meta {{ color: var(--gray); font-size: 13px; margin-bottom: 18px; }}
+  table {{ border-collapse: collapse; width: 100%; margin: 12px 0 22px;
           font-size: 14px; }}
   th {{ background: var(--navy); color: #fff; text-align: left;
        padding: 10px 12px; font-weight: 600; }}
-  td {{ padding: 9px 12px; border-bottom: 1px solid #e3e6eb; }}
+  td {{ padding: 9px 12px; border-bottom: 1px solid #e3e6eb; vertical-align: top; }}
   tr:nth-child(even) td {{ background: #fafbfc; }}
   .pill {{ display: inline-block; padding: 2px 10px; border-radius: 12px;
           font-size: 12px; font-weight: 600; }}
-  .pill.pass {{ background: #DBEFD9; color: var(--pass); }}
-  .pill.fail {{ background: #FDE3E3; color: var(--fail); }}
-  .pill.warn {{ background: #FBF1D5; color: var(--warn); }}
+  .pill.pass, .pill.verified_real {{ background: #DBEFD9; color: var(--pass); }}
+  .pill.fail, .pill.hallucinated   {{ background: #FDE3E3; color: var(--fail); }}
+  .pill.warn, .pill.unparseable, .pill.skipped {{ background: #FBF1D5; color: var(--warn); }}
   .pill.info {{ background: #DBE7F0; color: var(--blue); }}
   .callout {{ background: #FCF0C8; border-left: 4px solid var(--warn);
-             padding: 14px 18px; margin: 20px 0; font-style: italic;
+             padding: 14px 18px; margin: 18px 0; font-style: italic;
              color: #5C4A0A; }}
   code {{ background: #eef0f4; padding: 1px 5px; border-radius: 3px;
          font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 13px; }}
-  .footer {{ margin-top: 40px; padding-top: 14px; border-top: 1px solid #e3e6eb;
+  .case-card {{ margin: 28px 0; border: 1px solid #e3e6eb; border-radius: 8px;
+               overflow: hidden; }}
+  .case-card .case-hero {{ background: linear-gradient(135deg, var(--navy) 0%, var(--blue) 100%);
+                          color: #fff; padding: 22px 28px; }}
+  .case-card .case-hero h3 {{ color: #fff; margin: 0 0 6px 0; font-size: 1.4em;
+                             border: none; padding: 0; }}
+  .case-card .case-hero .citations {{ font-family: "SF Mono", Menlo, Consolas, monospace;
+                                     font-size: 13px; opacity: 0.92; }}
+  .case-card .case-hero .citations .sep {{ opacity: 0.5; padding: 0 6px; }}
+  .case-card .case-hero .court-line {{ font-size: 13px; opacity: 0.92; margin-top: 8px; }}
+  .case-card .case-body {{ padding: 18px 28px 4px; background: #fff;
+                          font: 16px/1.65 Georgia, "Times New Roman", serif; }}
+  .case-card table.info {{ font-size: 14px;
+                          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
+  .case-card table.info td {{ padding: 7px 10px; }}
+  .case-card table.info td.k {{ color: var(--gray); width: 200px; }}
+  .syllabus {{ background: #f6f8fb; border-left: 4px solid var(--blue);
+              padding: 14px 18px; margin: 14px 0; font-size: 0.97em;
+              white-space: pre-wrap; }}
+  .procedural {{ background: #f6f8fb; border-left: 4px solid var(--gray);
+                padding: 14px 18px; margin: 14px 0; font-size: 0.97em;
+                white-space: pre-wrap; }}
+  .opinion {{ margin-top: 24px; border-left: 4px solid var(--blue);
+             padding: 12px 18px 16px 22px; background: #fafbfd; }}
+  .opinion h4 {{ margin: 0 0 8px 0; font-size: 1em; color: var(--navy);
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
+  .opinion .by {{ color: var(--gray); font-weight: 400; font-style: italic;
+                font-size: 0.92em; margin-left: 6px; }}
+  .opinion .text-html p {{ margin: 0 0 1em; }}
+  .opinion pre.text-plain {{ font: 16px/1.7 Georgia, "Times New Roman", serif;
+                            white-space: pre-wrap; word-wrap: break-word;
+                            margin: 0; background: transparent; }}
+  .footer {{ margin-top: 24px; padding: 16px 56px; border-top: 1px solid #e3e6eb;
             color: var(--gray); font-size: 12px; }}
+  a {{ color: var(--blue); }}
+  .hero a {{ color: #cfe0f4; }}
 </style>
 </head>
 <body>
 <div class="wrap">
-  <h1>JurisLPO — Citation-Verification Report</h1>
-  <div class="meta">
-    Generated: {generated_at} &nbsp;|&nbsp;
-    Auth mode: <code>{auth_mode}</code> &nbsp;|&nbsp;
-    Eyecite: <code>{eyecite_version}</code>
+  <div class="hero">
+    <h1>Citation Verification Report</h1>
+    <div class="meta">Memo: <code>{memo_path}</code> &nbsp;·&nbsp;
+        Auth: <code>{auth_mode}</code> &nbsp;·&nbsp;
+        Eyecite: <code>{eyecite_version}</code> &nbsp;·&nbsp;
+        Generated {generated_at}</div>
+    <div class="stats">{stat_boxes}</div>
   </div>
 
-  <h2>Summary</h2>
-  <table>
-    <thead><tr><th>Test</th><th>Status</th><th>Detail</th><th>Latency</th></tr></thead>
-    <tbody>{summary_rows}</tbody>
-  </table>
+  <div class="body-pad">
+    <h2>System health</h2>
+    <table>
+      <thead><tr><th>Check</th><th>Status</th><th>Detail</th><th>Latency</th></tr></thead>
+      <tbody>{summary_rows}</tbody>
+    </table>
 
-  <h2>Practice-area coverage (Search API)</h2>
-  <table>
-    <thead><tr><th>Area</th><th>Query</th><th>Hits</th><th>Top result</th><th>Latency</th></tr></thead>
-    <tbody>{coverage_rows}</tbody>
-  </table>
+    {practice_section}
 
-  <h2>Eyecite local extraction</h2>
-  <table>
-    <thead><tr><th>#</th><th>Type</th><th>Matched</th><th>Reporter</th><th>Metadata</th></tr></thead>
-    <tbody>{eyecite_rows}</tbody>
-  </table>
+    <h2>Memo analysis</h2>
+    {memo_summary_meta}
+    <table>
+      <thead><tr><th>#</th><th>Citation</th><th>Verdict</th>
+                 <th>Case name</th><th>Detail</th></tr></thead>
+      <tbody>{memo_rows}</tbody>
+    </table>
 
-  <h2>Hybrid hallucination detector</h2>
-  <table>
-    <thead><tr><th>Citation</th><th>Expected</th><th>Hits</th><th>Verdict</th><th>Correct?</th></tr></thead>
-    <tbody>{hybrid_rows}</tbody>
-  </table>
-
-  <div class="callout">
-    Hallucinations have two failure modes — <b>structural</b> (Eyecite catches)
-    and <b>existence</b> (database lookup catches). This tool exercises both.
+    {cases_section}
   </div>
 
   <div class="footer">
-    juris-citation-verify · MIT licensed · regenerate any time with
-    <code>python verify.py</code>
+    juris-citation-verify · MIT licensed · auth: <code>{auth_mode}</code> ·
+    eyecite: <code>{eyecite_version}</code> · {generated_at}
   </div>
 </div>
 </body>
@@ -814,111 +845,8 @@ def _row(cells: list[str]) -> str:
     return "<tr>" + "".join(f"<td>{c}</td>" for c in cells) + "</tr>"
 
 
-def _pill(status: str) -> str:
-    return f'<span class="pill {status}">{status}</span>'
-
-
-CASE_HTML_TEMPLATE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>{case_name} — JurisLPO Case Extract</title>
-<style>
-  :root {{
-    --navy: #1F3A5F;
-    --blue: #2E5C8A;
-    --gray: #5A6470;
-    --bg:   #F5F7FA;
-    --pass: #2E7D32;
-    --warn: #B8860B;
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    font: 16px/1.65 Georgia, "Times New Roman", serif;
-    background: var(--bg); color: #1F1F1F; margin: 0; padding: 32px;
-  }}
-  .wrap {{ max-width: 920px; margin: 0 auto; background: #fff;
-          border-radius: 8px; box-shadow: 0 2px 24px rgba(0,0,0,0.06);
-          overflow: hidden; }}
-  .hero {{ background: linear-gradient(135deg, var(--navy) 0%, var(--blue) 100%);
-          color: #fff; padding: 36px 56px; }}
-  .hero h1 {{ margin: 0 0 10px 0; font-size: 1.85em; line-height: 1.25; }}
-  .hero .citations {{ font-family: "SF Mono", Menlo, Consolas, monospace;
-                     font-size: 14px; opacity: 0.92; margin-top: 6px; }}
-  .hero .citations .sep {{ opacity: 0.5; padding: 0 6px; }}
-  .hero .court-line {{ margin-top: 12px; font-size: 14px; opacity: 0.92;
-                      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
-  .body-pad {{ padding: 28px 56px 40px 56px; }}
-  h2 {{ color: var(--blue); font-size: 1.2em; margin-top: 32px;
-       border-bottom: 1px solid #d8dde4; padding-bottom: 6px;
-       font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
-  table.info {{ border-collapse: collapse; width: 100%; margin: 12px 0 8px;
-               font-size: 14px;
-               font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
-  table.info td {{ padding: 8px 10px; border-bottom: 1px solid #eef0f4;
-                  vertical-align: top; }}
-  table.info td.k {{ color: var(--gray); width: 200px; }}
-  code {{ background: #eef0f4; padding: 1px 6px; border-radius: 3px;
-         font-family: "SF Mono", Menlo, Consolas, monospace; font-size: 0.92em; }}
-  .callout {{ background: #FCF0C8; border-left: 4px solid var(--warn);
-             padding: 14px 18px; margin: 22px 0; font-size: 14px;
-             font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-             font-style: italic; color: #5C4A0A; }}
-  .callout ul {{ margin: 6px 0 0 18px; padding: 0; font-style: normal; }}
-  .syllabus {{ background: #f6f8fb; border-left: 4px solid var(--blue);
-              padding: 16px 20px; margin: 18px 0; font-size: 0.97em;
-              white-space: pre-wrap; }}
-  .procedural {{ background: #f6f8fb; border-left: 4px solid var(--gray);
-                padding: 16px 20px; margin: 18px 0; font-size: 0.97em;
-                white-space: pre-wrap; }}
-  .opinion {{ margin-top: 28px; border-left: 4px solid var(--blue);
-             padding: 14px 20px 18px 22px; background: #fafbfd; }}
-  .opinion h3 {{ margin: 0 0 10px 0; font-size: 1.08em; color: var(--navy);
-                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
-  .opinion .by {{ color: var(--gray); font-weight: 400; font-style: italic;
-                font-size: 0.92em; margin-left: 8px; }}
-  .opinion .text-html {{ font: 16px/1.7 Georgia, "Times New Roman", serif; }}
-  .opinion .text-html p {{ margin: 0 0 1em; }}
-  .opinion pre.text-plain {{ font: 16px/1.7 Georgia, "Times New Roman", serif;
-                            white-space: pre-wrap; word-wrap: break-word;
-                            margin: 0; background: transparent; }}
-  .footer {{ margin-top: 40px; padding: 16px 56px; border-top: 1px solid #e3e6eb;
-            color: var(--gray); font-size: 12px;
-            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif; }}
-  a {{ color: var(--blue); }}
-  .hero a {{ color: #cfe0f4; }}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <div class="hero">
-    <h1>{case_name}</h1>
-    <div class="citations">{citations_inline}</div>
-    <div class="court-line">{court_line}</div>
-  </div>
-
-  <div class="body-pad">
-    <h2>Case information</h2>
-    <table class="info">{info_rows}</table>
-
-    {auth_callout}
-    {syllabus_block}
-    {procedural_block}
-
-    <h2>Opinions</h2>
-    {opinions_block}
-  </div>
-
-  <div class="footer">
-    Source: <a href="{cluster_url}">CourtListener cluster {cluster_id}</a> ·
-    Fetched {fetched_at} ·
-    Mode: <code>{auth_mode}</code> ·
-    Generated by <code>juris-citation-verify</code>
-  </div>
-</div>
-</body>
-</html>
-"""
+def _pill(status: str, label: str | None = None) -> str:
+    return f'<span class="pill {status}">{html_escape(label or status)}</span>'
 
 
 def _opinion_label(type_code: str) -> str:
@@ -930,8 +858,20 @@ def _format_op_heading(op: Opinion) -> str:
     return f"{label} — {op.author_str}" if op.author_str else label
 
 
-def render_case_html(case: Case, path: Path) -> None:
-    """Single-file standalone HTML for a Case."""
+VERDICT_LABEL = {
+    "verified_real": "✅ verified",
+    "hallucinated":  "🚨 hallucinated",
+    "unparseable":   "⚠️ unparseable",
+    "skipped":       "⏸ skipped",
+}
+
+
+def _case_anchor(idx: int) -> str:
+    return f"case-{idx}"
+
+
+def _render_case_card_html(case: Case, anchor: str) -> str:
+    """Inner HTML for a single verified case (no <html><head>)."""
     cluster_url = (
         f"https://www.courtlistener.com{case.absolute_url}"
         if case.absolute_url
@@ -941,7 +881,6 @@ def render_case_html(case: Case, path: Path) -> None:
         )
     )
 
-    # Hero — show the queried citation plus other citations as parallel.
     cite_chunks = [html_escape(case.queried_citation)]
     for c in case.citations:
         if _normalize_cite_str(c) != _normalize_cite_str(case.queried_citation):
@@ -960,19 +899,11 @@ def render_case_html(case: Case, path: Path) -> None:
     info_pairs: list[tuple[str, str]] = []
     if case.case_name_full and case.case_name_full != case.case_name:
         info_pairs.append(("Full caption", html_escape(case.case_name_full)))
-    info_pairs.append(
-        ("Citations",
-         ", ".join(f"<code>{html_escape(c)}</code>"
-                   for c in (case.citations or [case.queried_citation])))
-    )
-    if case.court:
-        info_pairs.append(("Court", html_escape(case.court)))
-    if case.court_id:
-        info_pairs.append(("Court ID", f"<code>{html_escape(case.court_id)}</code>"))
-    if case.date_filed:
-        info_pairs.append(("Decided", html_escape(case.date_filed)))
-    if case.date_argued:
-        info_pairs.append(("Argued", html_escape(case.date_argued)))
+    info_pairs.append((
+        "Citations",
+        ", ".join(f"<code>{html_escape(c)}</code>"
+                  for c in (case.citations or [case.queried_citation])),
+    ))
     if case.judges:
         info_pairs.append(("Judges", html_escape(case.judges)))
     if case.docket_number:
@@ -1002,32 +933,26 @@ def render_case_html(case: Case, path: Path) -> None:
             f"<ul>{items}</ul>"
             "Get a free token at "
             '<a href="https://www.courtlistener.com/help/api/rest/">'
-            "courtlistener.com/help/api/rest</a>, then "
-            "<code>export CL_TOKEN=&lt;token&gt;</code> and re-run.</div>"
+            "courtlistener.com/help/api/rest</a>, "
+            "<code>export CL_TOKEN=&lt;token&gt;</code>, then re-run.</div>"
         )
 
     syllabus_block = ""
     if case.syllabus:
-        # Syllabus often comes as HTML from CL — render as-is, but inside a
-        # styled wrapper. Whitespace-pre-wrap handles plain-text fallback.
         syllabus_block = (
-            "<h2>Syllabus</h2>\n"
+            "<h4>Syllabus</h4>\n"
             f'<div class="syllabus">{case.syllabus}</div>'
         )
 
     procedural_block = ""
     if case.procedural_history:
         procedural_block = (
-            "<h2>Procedural history</h2>\n"
+            "<h4>Procedural history</h4>\n"
             f'<div class="procedural">{case.procedural_history}</div>'
         )
 
-    if not case.opinions:
-        opinions_block = (
-            '<div class="callout">No opinion bodies were returned for this case.</div>'
-        )
-    else:
-        parts: list[str] = []
+    if case.opinions:
+        op_parts: list[str] = []
         for op in case.opinions:
             heading = html_escape(_opinion_label(op.type))
             by = (
@@ -1040,267 +965,245 @@ def render_case_html(case: Case, path: Path) -> None:
                 body = f'<pre class="text-plain">{html_escape(op.text)}</pre>'
             else:
                 body = (
-                    '<div class="callout">No body text returned for this opinion '
-                    "(authenticated mode required).</div>"
+                    '<div class="callout">No body text returned for this opinion.</div>'
                 )
-            parts.append(
+            op_parts.append(
                 '<div class="opinion">\n'
-                f"  <h3>{heading}{by}</h3>\n"
+                f"  <h4>{heading}{by}</h4>\n"
                 f"  {body}\n"
                 "</div>"
             )
-        opinions_block = "\n".join(parts)
+        opinions_block = "\n".join(op_parts)
+    else:
+        opinions_block = ""  # already noted in auth_callout
 
-    fetched_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    out = CASE_HTML_TEMPLATE.format(
-        case_name=html_escape(case.case_name or case.queried_citation),
-        citations_inline=citations_inline,
-        court_line=court_line,
-        info_rows=info_rows,
-        auth_callout=auth_callout,
-        syllabus_block=syllabus_block,
-        procedural_block=procedural_block,
-        opinions_block=opinions_block,
-        cluster_url=html_escape(cluster_url),
-        cluster_id=case.cluster_id or "",
-        fetched_at=html_escape(fetched_at),
-        auth_mode=html_escape(case.auth_mode),
+    return (
+        f'<div class="case-card" id="{html_escape(anchor)}">\n'
+        '  <div class="case-hero">\n'
+        f'    <h3>{html_escape(case.case_name or case.queried_citation)}</h3>\n'
+        f'    <div class="citations">{citations_inline}</div>\n'
+        f'    <div class="court-line">{court_line}</div>\n'
+        "  </div>\n"
+        '  <div class="case-body">\n'
+        f"    <table class=\"info\">{info_rows}</table>\n"
+        f"    {auth_callout}\n"
+        f"    {syllabus_block}\n"
+        f"    {procedural_block}\n"
+        f"    {opinions_block}\n"
+        "  </div>\n"
+        "</div>"
     )
-    path.write_text(out, encoding="utf-8")
-
-
-def render_case_text(case: Case, path: Path) -> None:
-    """Plain-text export wrapped at 90 columns. Case name leads the metadata block."""
-    width = 90
-
-    def wrap(label: str, value: str) -> list[str]:
-        if not value:
-            return []
-        lead = f"{label}: "
-        body = textwrap.fill(
-            value,
-            width=width,
-            initial_indent=lead,
-            subsequent_indent=" " * len(lead),
-        )
-        return [body]
-
-    lines: list[str] = []
-    lines.append(case.case_name or case.queried_citation)
-    lines.append("=" * min(width, len(lines[0])))
-    lines.append("")
-
-    if case.case_name_full and case.case_name_full != case.case_name:
-        lines.extend(wrap("Full caption", case.case_name_full))
-    lines.extend(wrap("Citations", ", ".join(case.citations or [case.queried_citation])))
-    lines.extend(wrap("Court", case.court))
-    lines.extend(wrap("Court ID", case.court_id))
-    lines.extend(wrap("Decided", case.date_filed))
-    lines.extend(wrap("Argued", case.date_argued))
-    lines.extend(wrap("Judges", case.judges))
-    lines.extend(wrap("Docket number", case.docket_number))
-    lines.extend(wrap("Posture", case.posture))
-    lines.extend(wrap("Status", case.status))
-    if case.absolute_url:
-        lines.extend(wrap("CourtListener", f"https://www.courtlistener.com{case.absolute_url}"))
-    lines.extend(wrap("Auth mode", case.auth_mode))
-
-    if case.auth_mode != "authenticated":
-        lines.append("")
-        lines.append("-" * width)
-        for note in case.notes:
-            lines.append(textwrap.fill(note, width=width))
-
-    if case.syllabus:
-        lines.append("")
-        lines.append("SYLLABUS")
-        lines.append("-" * width)
-        lines.append(textwrap.fill(_strip_html(case.syllabus), width=width))
-
-    if case.procedural_history:
-        lines.append("")
-        lines.append("PROCEDURAL HISTORY")
-        lines.append("-" * width)
-        lines.append(textwrap.fill(_strip_html(case.procedural_history), width=width))
-
-    if case.opinions:
-        for op in case.opinions:
-            lines.append("")
-            lines.append(_format_op_heading(op).upper())
-            lines.append("-" * width)
-            text = op.text or _strip_html(op.html)
-            if text:
-                for paragraph in text.split("\n\n"):
-                    paragraph = paragraph.strip()
-                    if not paragraph:
-                        continue
-                    lines.append(textwrap.fill(paragraph, width=width))
-                    lines.append("")
-            else:
-                lines.append("(no body text returned)")
-    else:
-        lines.append("")
-        lines.append("(no opinion bodies returned)")
-
-    path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-
-
-def print_case_to_console(case: Case) -> None:
-    """Rich panels with truncated opinion excerpts (max 3000 chars per opinion)."""
-    EXCERPT_LIMIT = 3000
-
-    if RICH:
-        header_lines = [f"[bold white]{case.case_name or case.queried_citation}[/bold white]"]
-        cite_str = " · ".join(case.citations or [case.queried_citation])
-        header_lines.append(f"[white]{cite_str}[/white]")
-        court_bits: list[str] = []
-        if case.court:
-            court_bits.append(case.court)
-        if case.date_filed:
-            court_bits.append(f"Decided {case.date_filed}")
-        if case.date_argued:
-            court_bits.append(f"Argued {case.date_argued}")
-        if court_bits:
-            header_lines.append(f"[white]{' · '.join(court_bits)}[/white]")
-        console.print(
-            Panel(
-                "\n".join(header_lines),
-                border_style="cyan",
-                box=box.DOUBLE,
-            )
-        )
-
-        info = Table(box=box.SIMPLE_HEAVY, show_header=False)
-        info.add_column("k", style="dim", width=20)
-        info.add_column("v")
-        if case.case_name_full and case.case_name_full != case.case_name:
-            info.add_row("Full caption", case.case_name_full)
-        info.add_row("Citations", ", ".join(case.citations or [case.queried_citation]))
-        if case.court:
-            info.add_row("Court", case.court)
-        if case.court_id:
-            info.add_row("Court ID", case.court_id)
-        if case.date_filed:
-            info.add_row("Decided", case.date_filed)
-        if case.date_argued:
-            info.add_row("Argued", case.date_argued)
-        if case.judges:
-            info.add_row("Judges", case.judges)
-        if case.docket_number:
-            info.add_row("Docket", case.docket_number)
-        if case.posture:
-            info.add_row("Posture", case.posture)
-        if case.status:
-            info.add_row("Status", case.status)
-        if case.absolute_url:
-            info.add_row(
-                "CourtListener",
-                f"https://www.courtlistener.com{case.absolute_url}",
-            )
-        info.add_row("Auth mode", case.auth_mode)
-        console.print(info)
-    else:
-        print(f"\n=== {case.case_name or case.queried_citation} ===")
-        print(f"  Citations: {', '.join(case.citations or [case.queried_citation])}")
-        print(f"  Court: {case.court}    Decided: {case.date_filed}")
-        if case.judges:
-            print(f"  Judges: {case.judges}")
-        if case.docket_number:
-            print(f"  Docket: {case.docket_number}")
-        print(f"  Auth mode: {case.auth_mode}")
-
-    if case.auth_mode != "authenticated":
-        for note in case.notes:
-            say(note, "warn")
-
-    if case.syllabus:
-        banner("Syllabus")
-        text = _strip_html(case.syllabus)
-        if RICH:
-            console.print(text[:EXCERPT_LIMIT])
-            if len(text) > EXCERPT_LIMIT:
-                console.print(f"[dim]… (+{len(text) - EXCERPT_LIMIT:,} chars truncated)[/dim]")
-        else:
-            print(text[:EXCERPT_LIMIT])
-            if len(text) > EXCERPT_LIMIT:
-                print(f"... (+{len(text) - EXCERPT_LIMIT} chars truncated)")
-
-    if case.procedural_history:
-        banner("Procedural history")
-        text = _strip_html(case.procedural_history)
-        if RICH:
-            console.print(text[:EXCERPT_LIMIT])
-        else:
-            print(text[:EXCERPT_LIMIT])
-
-    if case.opinions:
-        for i, op in enumerate(case.opinions, 1):
-            banner(f"Opinion {i} · {_format_op_heading(op)}")
-            body = op.text or _strip_html(op.html)
-            if not body:
-                say("(no body text — set CL_TOKEN for full opinions)", "warn")
-                continue
-            excerpt = body[:EXCERPT_LIMIT]
-            if RICH:
-                console.print(excerpt)
-                if len(body) > EXCERPT_LIMIT:
-                    console.print(
-                        f"[dim]… (+{len(body) - EXCERPT_LIMIT:,} chars truncated; "
-                        "full text in --html / --text exports)[/dim]"
-                    )
-            else:
-                print(excerpt)
-                if len(body) > EXCERPT_LIMIT:
-                    print(f"... (+{len(body) - EXCERPT_LIMIT} chars truncated)")
-    else:
-        say("(no opinion bodies returned)", "warn")
 
 
 def render_html(report: Report, out_path: Path) -> None:
+    """Unified single-file HTML report: system health + memo analysis + case cards."""
+    analysis = report.memo_analysis or MemoAnalysis(
+        memo_path="(none)", auth_mode=report.auth_mode,
+    )
+
+    # ---- Hero stat boxes ----
+    hallucinated_class = "stat bad" if analysis.hallucinated > 0 else "stat good"
+    stat_blocks: list[str] = [
+        f'<div class="stat"><div class="num">{analysis.total_citations}</div>'
+        '<div class="label">citations parsed</div></div>',
+        f'<div class="stat good"><div class="num">{analysis.verified}</div>'
+        '<div class="label">verified</div></div>',
+        f'<div class="{hallucinated_class}"><div class="num">{analysis.hallucinated}</div>'
+        '<div class="label">hallucinated</div></div>',
+    ]
+    stat_boxes = "\n".join(stat_blocks)
+
+    # ---- System health table ----
     summary_rows = "\n".join(
         _row([
-            r.name,
+            html_escape(r.name),
             _pill(r.status),
-            r.detail or "",
+            html_escape(r.detail or ""),
             f"{r.latency_ms:.0f} ms" if r.latency_ms else "",
         ])
         for r in report.results
-    )
-    coverage_rows = "\n".join(
-        _row([
-            e["area"],
-            e["query"],
-            str(e["hits"]),
-            e.get("top", ""),
-            f"{e['latency_ms']:.0f} ms",
-        ])
-        for e in report.practice_area_results
-    )
-    eyecite_rows = "\n".join(
-        _row([str(e["i"]), e["type"], f"<code>{e['matched']}</code>", e["reporter"], e["meta"]])
-        for e in report.eyecite_extractions
-    )
-    hybrid_rows = "\n".join(
-        _row([
-            f"<code>{e['citation']}</code>",
-            e["expected"],
-            str(e["hits"]),
-            e["verdict"],
-            "✅" if e["correct"] else "❌",
-        ])
-        for e in report.hybrid_detector
+    ) or _row(["—", "—", "—", "—"])
+
+    # ---- Practice-area section ----
+    if report.practice_area_results:
+        coverage_rows = "\n".join(
+            _row([
+                html_escape(e["area"]),
+                f"<code>{html_escape(e['query'])}</code>",
+                str(e["hits"]),
+                html_escape(e.get("top", "")),
+                f"{e['latency_ms']:.0f} ms",
+            ])
+            for e in report.practice_area_results
+        )
+        practice_section = (
+            "<h3>Practice-area coverage</h3>\n"
+            "<table>\n"
+            "<thead><tr><th>Area</th><th>Query</th><th>Hits</th>"
+            "<th>Top result</th><th>Latency</th></tr></thead>\n"
+            f"<tbody>{coverage_rows}</tbody>\n</table>"
+        )
+    else:
+        practice_section = ""
+
+    # ---- Memo analysis table + per-case cards ----
+    memo_rows_parts: list[str] = []
+    case_cards: list[str] = []
+    for i, case in enumerate(analysis.cases, 1):
+        verdict_label = VERDICT_LABEL.get(case.verdict, case.verdict)
+        if case.verdict == "verified_real":
+            anchor = _case_anchor(i)
+            detail_html = f'<a href="#{html_escape(anchor)}">view full case</a>'
+            case_cards.append(_render_case_card_html(case, anchor))
+        elif case.verdict == "hallucinated":
+            detail_html = "no CourtListener match"
+        elif case.verdict == "skipped":
+            detail_html = "no network"
+        else:
+            detail_html = "—"
+        memo_rows_parts.append(
+            _row([
+                str(i),
+                f"<code>{html_escape(case.queried_citation)}</code>",
+                _pill(case.verdict, verdict_label),
+                html_escape(case.case_name or "—"),
+                detail_html,
+            ])
+        )
+    memo_rows = "\n".join(memo_rows_parts) or _row(["—", "—", "—", "—", "—"])
+
+    memo_summary_meta = (
+        f'<div class="meta">Memo: <code>{html_escape(analysis.memo_path)}</code> · '
+        f"{analysis.total_citations} full citations · "
+        f"{analysis.verified} verified · {analysis.hallucinated} hallucinated · "
+        f"{analysis.unparseable} unparseable"
+        + (f" · {analysis.skipped} skipped" if analysis.skipped else "")
+        + "</div>"
     )
 
+    if case_cards:
+        cases_section = "<h2>Verified cases</h2>\n" + "\n".join(case_cards)
+    else:
+        cases_section = ""
+
     html = HTML_TEMPLATE.format(
-        generated_at=report.finished_at,
-        auth_mode=report.auth_mode,
-        eyecite_version=report.eyecite_version,
-        summary_rows=summary_rows or _row(["—", "—", "—", "—"]),
-        coverage_rows=coverage_rows or _row(["—", "—", "—", "—", "—"]),
-        eyecite_rows=eyecite_rows or _row(["—", "—", "—", "—", "—"]),
-        hybrid_rows=hybrid_rows or _row(["—", "—", "—", "—", "—"]),
+        memo_path=html_escape(analysis.memo_path),
+        auth_mode=html_escape(report.auth_mode),
+        eyecite_version=html_escape(report.eyecite_version),
+        generated_at=html_escape(report.finished_at or ""),
+        stat_boxes=stat_boxes,
+        summary_rows=summary_rows,
+        practice_section=practice_section,
+        memo_summary_meta=memo_summary_meta,
+        memo_rows=memo_rows,
+        cases_section=cases_section,
     )
     out_path.write_text(html, encoding="utf-8")
+
+
+def print_memo_analysis_to_console(analysis: MemoAnalysis | None) -> None:
+    """Console summary: per-citation verdict table, then per-verified-case detail."""
+    EXCERPT_LIMIT = 3000
+    if analysis is None:
+        return
+
+    banner("Memo analysis · summary")
+    if RICH:
+        t = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan")
+        t.add_column("#", width=3)
+        t.add_column("Citation", width=18)
+        t.add_column("Verdict", width=18)
+        t.add_column("Case name", width=46, overflow="ellipsis")
+        for i, case in enumerate(analysis.cases, 1):
+            verdict_label = VERDICT_LABEL.get(case.verdict, case.verdict)
+            colour = {
+                "verified_real": "green",
+                "hallucinated": "red",
+                "unparseable": "yellow",
+                "skipped": "yellow",
+            }.get(case.verdict, "white")
+            t.add_row(
+                str(i),
+                case.queried_citation,
+                f"[{colour}]{verdict_label}[/]",
+                case.case_name or "—",
+            )
+        console.print(t)
+    else:
+        for i, case in enumerate(analysis.cases, 1):
+            verdict_label = VERDICT_LABEL.get(case.verdict, case.verdict)
+            print(f"  [{i}] {case.queried_citation:18s} {verdict_label:18s} "
+                  f"{case.case_name or '—'}")
+
+    summary = (
+        f"{analysis.verified}/{analysis.total_citations} verified · "
+        f"{analysis.hallucinated} hallucinated · "
+        f"{analysis.unparseable} unparseable"
+    )
+    if analysis.skipped:
+        summary += f" · {analysis.skipped} skipped"
+    overall = "pass" if (analysis.hallucinated == 0 and analysis.unparseable == 0) else "warn"
+    say(summary, overall)
+
+    verified_cases = [c for c in analysis.cases if c.verdict == "verified_real"]
+    if not verified_cases:
+        return
+
+    for i, case in enumerate(verified_cases, 1):
+        banner(f"Case {i} · {case.case_name or case.queried_citation}")
+        if RICH:
+            info = Table(box=box.SIMPLE_HEAVY, show_header=False)
+            info.add_column("k", style="dim", width=20)
+            info.add_column("v")
+            info.add_row("Citations", ", ".join(case.citations or [case.queried_citation]))
+            if case.court:
+                info.add_row("Court", case.court)
+            if case.date_filed:
+                info.add_row("Decided", case.date_filed)
+            if case.judges:
+                info.add_row("Judges", case.judges)
+            if case.docket_number:
+                info.add_row("Docket", case.docket_number)
+            if case.absolute_url:
+                info.add_row(
+                    "CourtListener",
+                    f"https://www.courtlistener.com{case.absolute_url}",
+                )
+            console.print(info)
+        else:
+            print(f"  Citations: {', '.join(case.citations or [case.queried_citation])}")
+            print(f"  Court: {case.court}    Decided: {case.date_filed}")
+
+        if case.auth_mode != "authenticated":
+            for note in case.notes:
+                say(note, "warn")
+
+        if case.opinions:
+            for j, op in enumerate(case.opinions, 1):
+                say(f"Opinion {j}: {_format_op_heading(op)}", "info")
+                body = op.text or _strip_html(op.html)
+                if not body:
+                    continue
+                excerpt = body[:EXCERPT_LIMIT]
+                if RICH:
+                    console.print(excerpt)
+                    if len(body) > EXCERPT_LIMIT:
+                        console.print(
+                            f"[dim]… (+{len(body) - EXCERPT_LIMIT:,} chars truncated; "
+                            "full text in --html export)[/dim]"
+                        )
+                else:
+                    print(excerpt)
+                    if len(body) > EXCERPT_LIMIT:
+                        print(f"... (+{len(body) - EXCERPT_LIMIT} chars truncated)")
+        elif case.syllabus:
+            say("Syllabus excerpt:", "info")
+            text = _strip_html(case.syllabus)
+            excerpt = text[:EXCERPT_LIMIT]
+            if RICH:
+                console.print(excerpt)
+            else:
+                print(excerpt)
 
 
 # ---------------------------------------------------------------------------
@@ -1308,91 +1211,29 @@ def render_html(report: Report, out_path: Path) -> None:
 # ---------------------------------------------------------------------------
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Verify CourtListener API + Eyecite parser hands-on."
+        description="Verify CourtListener API + Eyecite parser, then analyse a memo "
+        "(parse citations + verify each one against CourtListener).",
     )
-    parser.add_argument("--html", type=Path, help="Path to write HTML report (verification) or HTML case page (--extract)")
-    parser.add_argument("--json", type=Path, help="Path to write raw JSON results / case data")
-    parser.add_argument("--text", type=Path, help="(--extract only) Path to write plain-text case dump")
-    parser.add_argument("--memo", type=Path, help="Path to a custom test memo (.txt)")
+    parser.add_argument("--html", type=Path, help="Path to write the unified HTML report")
+    parser.add_argument("--json", type=Path, help="Path to write raw JSON results")
+    parser.add_argument("--memo", type=Path, help="Path to a memo (.txt). Defaults to sample_memo.txt")
     parser.add_argument("--no-net", action="store_true", help="Skip all network calls")
-    parser.add_argument("--quick", action="store_true", help="Skip slow practice-area test")
-    parser.add_argument(
-        "--extract",
-        metavar="CITATION",
-        help='Switch to case-extraction mode. Look up a single case by citation '
-        '(e.g. "576 U.S. 644") and dump full case detail. Skips verification stages.',
-    )
+    parser.add_argument("--quick", action="store_true", help="Skip slow practice-area stage")
     args = parser.parse_args()
 
     import eyecite as _eyecite
 
-    auth_mode = "authenticated" if CL_TOKEN else "anonymous"
-    eyecite_version = getattr(_eyecite, "__version__", "unknown")
-
-    # ----- Case-extraction mode (bypasses verification stages) -----
-    if args.extract:
-        if args.no_net:
-            print("ERROR: --extract requires network access (cannot combine with --no-net).",
-                  file=sys.stderr)
-            return 2
-        if RICH:
-            console.print(
-                Panel(
-                    "[bold]juris-citation-verify · CASE EXTRACTION[/bold]\n"
-                    f"Citation: [cyan]{args.extract}[/cyan]\n"
-                    f"Auth mode: [cyan]{auth_mode}[/cyan]   "
-                    f"Eyecite: [cyan]{eyecite_version}[/cyan]",
-                    border_style="cyan",
-                    box=box.DOUBLE,
-                )
-            )
-        else:
-            print("=" * 60)
-            print(" juris-citation-verify · CASE EXTRACTION")
-            print(f" Citation: {args.extract}  |  Auth: {auth_mode}")
-            print("=" * 60)
-
-        try:
-            case = extract_case(args.extract)
-        except CaseUnparseable:
-            print(f"ERROR: Could not parse '{args.extract}' as a legal citation.",
-                  file=sys.stderr)
-            return 2
-        except CaseNotFound:
-            print("ERROR: Case not found in CourtListener.", file=sys.stderr)
-            return 3
-
-        print_case_to_console(case)
-
-        if args.html:
-            render_case_html(case, args.html)
-            say(f"Wrote HTML: {args.html}", "pass")
-        if args.text:
-            render_case_text(case, args.text)
-            say(f"Wrote text: {args.text}", "pass")
-        if args.json:
-            args.json.write_text(
-                json.dumps(asdict(case), indent=2, default=str),
-                encoding="utf-8",
-            )
-            say(f"Wrote JSON: {args.json}", "pass")
-        return 0
-
-    # ----- Verification mode -----
-    if args.text:
-        say("--text is only meaningful with --extract (ignored).", "warn")
-
     report = Report(
         started_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        auth_mode=auth_mode,
-        eyecite_version=eyecite_version,
+        auth_mode="authenticated" if CL_TOKEN else "anonymous",
+        eyecite_version=getattr(_eyecite, "__version__", "unknown"),
     )
 
     if RICH:
         console.print(
             Panel(
                 "[bold]juris-citation-verify[/bold]\n"
-                "Hands-on verification of CourtListener API + Eyecite\n"
+                "System health + Eyecite + per-citation CourtListener verification\n"
                 f"Auth mode: [cyan]{report.auth_mode}[/cyan]   "
                 f"Eyecite: [cyan]{report.eyecite_version}[/cyan]",
                 border_style="cyan",
@@ -1405,29 +1246,42 @@ def main() -> int:
         print(f" Auth: {report.auth_mode}  |  Eyecite: {report.eyecite_version}")
         print("=" * 60)
 
-    # Run stages
+    # System health stages
     if not args.no_net:
         stage_reachability(report)
         stage_anon_audit(report)
         if not args.quick:
             stage_practice_areas(report)
 
-    stage_eyecite_local(report, args.memo)
-
-    if not args.no_net:
-        stage_hybrid_detector(report)
+    # Memo analysis (Eyecite parse + per-citation verdict + extraction)
+    memo_path = args.memo if args.memo else Path("sample_memo.txt")
+    stage_memo_analysis(report, memo_path, do_network=not args.no_net)
 
     report.finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+    # Console: detailed memo analysis output (verdict table + per-case detail)
+    print_memo_analysis_to_console(report.memo_analysis)
 
     # Final tally
     banner("Final tally")
     passes = sum(1 for r in report.results if r.status == "pass")
     fails = sum(1 for r in report.results if r.status == "fail")
     warns = sum(1 for r in report.results if r.status == "warn")
-    say(f"{passes} passed · {warns} warnings · {fails} failed", "pass" if fails == 0 else "fail")
+    analysis = report.memo_analysis
+    if analysis and analysis.hallucinated > 0:
+        say(
+            f"🚨 {analysis.hallucinated} hallucinated citation"
+            f"{'s' if analysis.hallucinated != 1 else ''} found in memo",
+            "fail",
+        )
+    say(f"{passes} passed · {warns} warnings · {fails} failed",
+        "pass" if fails == 0 else "fail")
 
     if args.json:
-        args.json.write_text(json.dumps(report.to_dict(), indent=2, default=str))
+        args.json.write_text(
+            json.dumps(report.to_dict(), indent=2, default=str),
+            encoding="utf-8",
+        )
         say(f"Wrote JSON: {args.json}", "pass")
 
     if args.html:
