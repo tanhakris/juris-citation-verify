@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import random
 import sys
 import textwrap
 import time
@@ -141,7 +142,9 @@ class Opinion:
 @dataclass
 class Case:
     queried_citation: str
-    verdict: str = "verified_real"  # verified_real | hallucinated | unparseable | skipped
+    # verified_real | hallucinated | unparseable | skipped | api_error
+    verdict: str = "verified_real"
+    occurrences_in_memo: int = 1
     case_name: str = ""
     case_name_full: str = ""
     citations: list[str] = field(default_factory=list)
@@ -167,11 +170,13 @@ class Case:
 class MemoAnalysis:
     memo_path: str
     auth_mode: str
-    total_citations: int = 0
+    total_citations: int = 0       # unique by (vol, rep, pg)
+    raw_citation_tokens: int = 0   # before dedup
     verified: int = 0
     hallucinated: int = 0
     unparseable: int = 0
     skipped: int = 0
+    api_errors: int = 0
     cases: list[Case] = field(default_factory=list)
 
 
@@ -245,20 +250,57 @@ def _headers() -> dict[str, str]:
     return h
 
 
-def http(method: str, path: str, **kw) -> tuple[int, dict | str | None, float]:
-    """Returns (status_code, parsed_body_or_text, latency_ms)."""
+RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
+RETRY_DELAYS = (1.0, 2.0, 4.0)   # seconds before each retry (jittered)
+
+
+def http(
+    method: str,
+    path: str,
+    *,
+    verbose: bool = False,
+    **kw,
+) -> tuple[int, dict | str | None, float]:
+    """Returns (status_code, parsed_body_or_text, total_latency_ms).
+
+    Retries up to 3 times with exponential backoff (≈1s, 2s, 4s ± jitter)
+    on HTTP 429 / 500 / 502 / 503 / 504. A transient blip used to mark a
+    real case as hallucinated forever; the retry budget makes verdicts
+    deterministic across runs.
+    """
     url = path if path.startswith("http") else f"{CL_BASE}{path}"
-    t0 = time.time()
-    try:
-        r = requests.request(method, url, headers=_headers(), timeout=45, **kw)
-        elapsed = (time.time() - t0) * 1000
+    t_total = time.time()
+    last_status: int = -1
+    last_body: dict | str | None = None
+
+    for attempt in range(len(RETRY_DELAYS) + 1):  # 1 initial + 3 retries
         try:
-            return r.status_code, r.json(), elapsed
-        except ValueError:
-            return r.status_code, r.text, elapsed
-    except requests.RequestException as exc:
-        elapsed = (time.time() - t0) * 1000
-        return -1, str(exc), elapsed
+            r = requests.request(method, url, headers=_headers(), timeout=45, **kw)
+            try:
+                last_body = r.json()
+            except ValueError:
+                last_body = r.text
+            last_status = r.status_code
+        except requests.RequestException as exc:
+            last_status = -1
+            last_body = str(exc)
+
+        if last_status not in RETRYABLE_STATUSES:
+            return last_status, last_body, (time.time() - t_total) * 1000
+        if attempt >= len(RETRY_DELAYS):
+            return last_status, last_body, (time.time() - t_total) * 1000
+
+        delay = RETRY_DELAYS[attempt] * (0.85 + random.random() * 0.3)
+        if verbose:
+            say(
+                f"retry {attempt + 1}/{len(RETRY_DELAYS)}: HTTP {last_status} on "
+                f"{method} {path} — sleeping {delay:.2f}s",
+                "warn",
+            )
+        time.sleep(delay)
+
+    # Unreachable; loop always returns.
+    return last_status, last_body, (time.time() - t_total) * 1000
 
 
 # ---------------------------------------------------------------------------
@@ -526,33 +568,124 @@ def _fetch_sub_opinions(case: Case, sub_urls: list[str]) -> None:
         time.sleep(0.2)
 
 
-def extract_case(
-    citation_str: str,
-    eyecite_match: FullCaseCitation | None = None,
-) -> Case:
-    """Resolve a citation to a Case. Always returns a Case with `.verdict` set.
+def _build_case_from_cluster(canonical: str, cluster: dict) -> Case:
+    """Hydrate a Case from a /citation-lookup/ cluster object."""
+    cluster_cites = [
+        f"{c.get('volume', '')} {c.get('reporter', '')} {c.get('page', '')}".strip()
+        for c in (cluster.get("citations") or [])
+        if isinstance(c, dict)
+    ]
+    cluster_cites = [c for c in cluster_cites if c]
+    return Case(
+        queried_citation=canonical,
+        verdict="verified_real",
+        case_name=cluster.get("case_name") or cluster.get("case_name_full") or "",
+        case_name_full=cluster.get("case_name_full") or "",
+        citations=cluster_cites or [canonical],
+        date_filed=cluster.get("date_filed") or "",
+        date_argued=cluster.get("date_argued") or "",
+        judges=cluster.get("judges") or "",
+        syllabus=cluster.get("syllabus") or "",
+        procedural_history=cluster.get("procedural_history") or "",
+        posture=cluster.get("posture") or "",
+        absolute_url=cluster.get("absolute_url") or "",
+        cluster_id=cluster.get("id"),
+        auth_mode="authenticated" if CL_TOKEN else "anonymous",
+    )
 
-    `eyecite_match` may be supplied to skip re-parsing — used by
-    stage_memo_analysis which has already parsed the memo.
+
+def _hydrate_docket(case: Case, cluster: dict, verbose: bool = False) -> None:
+    """Authenticated only: fetch the docket → court_name + docket_number."""
+    docket_field = cluster.get("docket")
+    if not (isinstance(docket_field, str) and docket_field.startswith("http")):
+        return
+    dcode, docket, _ = http("GET", docket_field, verbose=verbose)
+    if dcode != 200 or not isinstance(docket, dict):
+        return
+    case.docket_number = docket.get("docket_number") or case.docket_number
+    case.court_id = docket.get("court_id") or case.court_id
+    court_field = docket.get("court")
+    if isinstance(court_field, str) and court_field.startswith("http"):
+        ccode, cbody, _ = http("GET", court_field, verbose=verbose)
+        if ccode == 200 and isinstance(cbody, dict):
+            case.court = cbody.get("full_name") or cbody.get("short_name") or case.court
+            case.court_id = cbody.get("id") or case.court_id
+    elif isinstance(court_field, dict):
+        case.court = court_field.get("full_name") or court_field.get("short_name") or case.court
+        case.court_id = court_field.get("id") or case.court_id
+
+
+def _extract_via_citation_lookup(canonical: str, verbose: bool = False) -> Case:
+    """Primary path: POST /citation-lookup/ (auth-only, deterministic).
+
+    Returns a Case whose verdict is one of:
+      - verified_real (cluster matched + populated)
+      - hallucinated  (per-citation status 404 / clusters empty)
+      - api_error     (HTTP non-200 after retries, or anomalous response shape)
     """
-    if eyecite_match is None:
-        cleaned = clean_text(citation_str, ["html", "inline_whitespace"])
-        parsed = [c for c in get_citations(cleaned) if isinstance(c, FullCaseCitation)]
-        if not parsed:
-            return Case(queried_citation=citation_str, verdict="unparseable")
-        eyecite_match = parsed[0]
+    code, body, ms = http(
+        "POST",
+        "/citation-lookup/",
+        data={"text": canonical},
+        verbose=verbose,
+    )
+    if verbose:
+        say(f"  POST /citation-lookup/ ← '{canonical}' → HTTP {code} ({ms:.0f} ms)", "info")
+        if isinstance(body, (dict, list)):
+            preview = json.dumps(body, default=str)[:500]
+            console.print(f"     [dim]{preview}{'…' if len(preview) >= 500 else ''}[/dim]") if RICH else print(f"     {preview}")
 
-    vol = eyecite_match.groups.get("volume", "") or ""
-    rep = eyecite_match.groups.get("reporter", "") or ""
-    pg = eyecite_match.groups.get("page", "") or ""
-    canonical = f"{vol} {rep} {pg}".strip()
-    if not (vol and rep and pg):
-        return Case(queried_citation=citation_str, verdict="unparseable")
+    if code != 200:
+        case = Case(queried_citation=canonical, verdict="api_error")
+        case.notes.append(f"POST /citation-lookup/ returned HTTP {code} after retries.")
+        if isinstance(body, dict):
+            err = body.get("detail") or body.get("error") or ""
+            if err:
+                case.notes.append(str(err))
+        return case
 
-    # order_by=dateFiled asc puts the case being cited near the top: any
-    # opinion that cites X was filed *after* X. Without this, common citations
-    # (e.g. Brown) are buried under thousands of cases that merely cite them.
-    code, body, _ = http(
+    if not isinstance(body, list) or not body:
+        case = Case(queried_citation=canonical, verdict="api_error")
+        case.notes.append("HTTP 200 but the citation-lookup body was empty / wrong shape.")
+        return case
+
+    entry = body[0] if isinstance(body[0], dict) else {}
+    per_status = entry.get("status", 200)
+    clusters = entry.get("clusters") or []
+
+    # Per-citation 404 (or 200 with no clusters) = the citation is real-looking
+    # but resolves to nothing in CL's index. That's a hallucination.
+    if per_status == 404 or (per_status == 200 and not clusters):
+        return Case(queried_citation=canonical, verdict="hallucinated")
+
+    # Per-citation status that is not 200 and not 404 is an API hiccup,
+    # not a hallucination. Surface it distinctly.
+    if per_status != 200:
+        case = Case(queried_citation=canonical, verdict="api_error")
+        err = entry.get("error_message") or f"per-citation status {per_status}"
+        case.notes.append(f"citation-lookup per-citation status {per_status}: {err}")
+        return case
+
+    if not isinstance(clusters[0], dict):
+        case = Case(queried_citation=canonical, verdict="api_error")
+        case.notes.append("citation-lookup returned a cluster entry of unexpected shape.")
+        return case
+
+    cluster = clusters[0]
+    case = _build_case_from_cluster(canonical, cluster)
+
+    # Authenticated enrichment: docket → court_name; _refine_from_cluster
+    # pulls sub_opinions for full text.
+    _hydrate_docket(case, cluster, verbose=verbose)
+    _refine_from_cluster(case)
+    return case
+
+
+def _extract_via_search(canonical: str, verbose: bool = False) -> Case:
+    """Fallback path for anonymous mode (no CL_TOKEN). /citation-lookup/
+    requires auth; /search/ does not. Less precise but still useful for
+    case-name + parallel-citation metadata."""
+    code, body, ms = http(
         "GET",
         "/search/",
         params={
@@ -561,8 +694,16 @@ def extract_case(
             "order_by": "dateFiled asc",
             "page_size": 50,
         },
+        verbose=verbose,
     )
-    if code != 200 or not isinstance(body, dict):
+    if verbose:
+        say(f"  GET /search/ ← '{canonical}' → HTTP {code} ({ms:.0f} ms)", "info")
+
+    if code != 200:
+        case = Case(queried_citation=canonical, verdict="api_error")
+        case.notes.append(f"GET /search/ returned HTTP {code} after retries.")
+        return case
+    if not isinstance(body, dict):
         return Case(queried_citation=canonical, verdict="hallucinated")
     match = _pick_cluster_from_search(canonical, body.get("results") or [])
     if match is None:
@@ -580,38 +721,68 @@ def extract_case(
         date_argued=match.get("dateArgued") or "",
         judges=match.get("judge") or "",
         docket_number=match.get("docketNumber") or "",
-        syllabus=match.get("syllabus") or "",
-        procedural_history=match.get("procedural_history") or "",
-        posture=match.get("posture") or "",
-        status=match.get("status") or "",
         absolute_url=match.get("absolute_url") or "",
         cluster_id=match.get("cluster_id"),
-        auth_mode="authenticated" if CL_TOKEN else "anonymous",
+        auth_mode="anonymous",
     )
+    case.fields_missing_due_to_auth = ["full opinion text", "concurrences", "dissents"]
+    case.notes.append(
+        "Anonymous mode: lookup via /search/ (less precise than /citation-lookup/). "
+        "Set CL_TOKEN for full opinion text and the deterministic citation-lookup path."
+    )
+    return case
+
+
+def extract_case(
+    citation_str: str,
+    eyecite_match: FullCaseCitation | None = None,
+    verbose: bool = False,
+) -> Case:
+    """Resolve a citation to a Case. Always returns a Case with `.verdict` set.
+
+    Primary path: POST /citation-lookup/ (when CL_TOKEN is present).
+    Fallback for anonymous use: GET /search/ + `_pick_cluster_from_search`.
+    """
+    if eyecite_match is None:
+        cleaned = clean_text(citation_str, ["html", "inline_whitespace"])
+        parsed = [c for c in get_citations(cleaned) if isinstance(c, FullCaseCitation)]
+        if not parsed:
+            return Case(queried_citation=citation_str, verdict="unparseable")
+        eyecite_match = parsed[0]
+
+    vol = eyecite_match.groups.get("volume", "") or ""
+    rep = eyecite_match.groups.get("reporter", "") or ""
+    pg = eyecite_match.groups.get("page", "") or ""
+    canonical = f"{vol} {rep} {pg}".strip()
+    if not (vol and rep and pg):
+        return Case(queried_citation=citation_str, verdict="unparseable")
 
     if CL_TOKEN:
-        _refine_from_cluster(case)
-    else:
-        case.fields_missing_due_to_auth = [
-            "full opinion text", "concurrences", "dissents",
-        ]
-        case.notes.append(
-            "Anonymous mode: only metadata + syllabus are available. "
-            "Get a free CourtListener token at "
-            "https://www.courtlistener.com/help/api/rest/ and re-run with "
-            "CL_TOKEN=<token> for full opinion text."
-        )
-    return case
+        return _extract_via_citation_lookup(canonical, verbose=verbose)
+    return _extract_via_search(canonical, verbose=verbose)
+
+
+def _citation_key(fc: FullCaseCitation) -> tuple[str, str, str]:
+    """Canonical dedup key. Lower-cased, whitespace-collapsed."""
+    return (
+        " ".join((fc.groups.get("volume", "") or "").split()).lower(),
+        " ".join((fc.groups.get("reporter", "") or "").split()).lower(),
+        " ".join((fc.groups.get("page", "") or "").split()).lower(),
+    )
 
 
 def stage_memo_analysis(
     report: Report,
     memo_path: Path | None,
     do_network: bool,
+    verbose: bool = False,
 ) -> None:
     """Parse the memo, extract every full citation, and tag a verdict per citation.
 
     Replaces the older stage_eyecite_local + stage_hybrid_detector duo.
+    Dedupes by (volume, reporter, page) — a legal memo typically lists each
+    case twice (Table of Authorities + body), and we don't want to double-bill
+    the API or risk inconsistent verdicts across the duplicates.
     """
     banner("Stage 4 · Memo analysis (Eyecite + CourtListener)")
     text = memo_path.read_text() if memo_path and memo_path.exists() else DEFAULT_TEST_MEMO
@@ -622,64 +793,100 @@ def stage_memo_analysis(
     full_cites = [c for c in citations if isinstance(c, FullCaseCitation)]
     parse_ms = (time.time() - t0) * 1000
 
+    # ----- Dedup pass -----
+    occurrence_counts: dict[tuple[str, str, str], int] = {}
+    deduped: list[FullCaseCitation] = []
+    for fc in full_cites:
+        key = _citation_key(fc)
+        if key in occurrence_counts:
+            occurrence_counts[key] += 1
+        else:
+            occurrence_counts[key] = 1
+            deduped.append(fc)
+
     say(
         f"Parsed {len(citations)} citation tokens "
-        f"({len(full_cites)} full case citations) in {parse_ms:.1f} ms "
-        f"({len(text)} chars input)",
+        f"({len(full_cites)} full cites, {len(deduped)} unique by vol/rep/page) "
+        f"in {parse_ms:.1f} ms ({len(text)} chars input)",
         "pass",
     )
 
     analysis = MemoAnalysis(
         memo_path=str(memo_path) if memo_path else "(default memo)",
         auth_mode=report.auth_mode,
-        total_citations=len(full_cites),
+        total_citations=len(deduped),
+        raw_citation_tokens=len(full_cites),
     )
 
     if not do_network:
         say("--no-net set: skipping CourtListener lookups.", "warn")
-        for fc in full_cites:
+        for fc in deduped:
             vol = fc.groups.get("volume", "") or ""
             rep = fc.groups.get("reporter", "") or ""
             pg = fc.groups.get("page", "") or ""
             canonical = f"{vol} {rep} {pg}".strip() or fc.matched_text()
-            analysis.cases.append(Case(queried_citation=canonical, verdict="skipped"))
-        analysis.skipped = len(full_cites)
+            analysis.cases.append(
+                Case(
+                    queried_citation=canonical,
+                    verdict="skipped",
+                    occurrences_in_memo=occurrence_counts[_citation_key(fc)],
+                )
+            )
+        analysis.skipped = len(deduped)
         report.memo_analysis = analysis
         report.results.append(
-            TestResult("memo_analysis", "pass", f"{len(full_cites)} citations (skipped lookups)")
+            TestResult("memo_analysis", "pass",
+                       f"{len(deduped)} unique citations (skipped lookups)")
         )
         return
 
     if RICH:
         progress = Table(box=box.SIMPLE_HEAVY, show_header=True, header_style="bold cyan")
         progress.add_column("#", width=3)
-        progress.add_column("Citation", width=18)
+        progress.add_column("Citation", width=22)
+        progress.add_column("Occ.", justify="right", width=5)
         progress.add_column("Verdict", width=18)
         progress.add_column("Case name", width=42, overflow="ellipsis")
 
-    for i, fc in enumerate(full_cites, 1):
-        case = extract_case(fc.matched_text(), eyecite_match=fc)
+    total = len(deduped)
+    for i, fc in enumerate(deduped, 1):
+        key = _citation_key(fc)
+        occurrences = occurrence_counts[key]
+        t_call = time.time()
+        case = extract_case(fc.matched_text(), eyecite_match=fc, verbose=verbose)
+        case.occurrences_in_memo = occurrences
+        call_ms = (time.time() - t_call) * 1000
         analysis.cases.append(case)
+
         if case.verdict == "verified_real":
             analysis.verified += 1
-            verdict_label = "✅ verified_real"
         elif case.verdict == "hallucinated":
             analysis.hallucinated += 1
-            verdict_label = "🚨 hallucinated"
+        elif case.verdict == "api_error":
+            analysis.api_errors += 1
         else:
             analysis.unparseable += 1
-            verdict_label = "⚠️  unparseable"
+
+        verdict_label = VERDICT_LABEL.get(case.verdict, case.verdict)
+        if verbose:
+            occ = f" [×{occurrences}]" if occurrences > 1 else ""
+            say(
+                f"[{i}/{total}] {case.queried_citation}{occ} → {verdict_label} "
+                f"· {case.case_name or '—'} · {call_ms:.0f}ms",
+                "info",
+            )
         if RICH:
             progress.add_row(
                 str(i),
                 case.queried_citation,
+                str(occurrences) if occurrences > 1 else "",
                 verdict_label,
                 case.case_name or "—",
             )
         else:
             print(
-                f"  [{i}] {case.queried_citation:18s} "
-                f"{verdict_label:18s} {case.case_name or '—'}"
+                f"  [{i}] {case.queried_citation:22s} "
+                f"×{occurrences:<2d} {verdict_label:18s} {case.case_name or '—'}"
             )
         time.sleep(0.2)
 
@@ -689,17 +896,17 @@ def stage_memo_analysis(
     report.memo_analysis = analysis
     overall = (
         "pass"
-        if analysis.hallucinated == 0 and analysis.unparseable == 0
+        if (analysis.hallucinated == 0
+            and analysis.unparseable == 0
+            and analysis.api_errors == 0)
         else "warn"
     )
-    report.results.append(
-        TestResult(
-            "memo_analysis",
-            overall,
-            f"{analysis.verified}/{analysis.total_citations} verified, "
-            f"{analysis.hallucinated} hallucinated, {analysis.unparseable} unparseable",
-        )
+    detail = (
+        f"{analysis.verified}/{analysis.total_citations} verified, "
+        f"{analysis.hallucinated} hallucinated, {analysis.unparseable} unparseable, "
+        f"{analysis.api_errors} api_errors"
     )
+    report.results.append(TestResult("memo_analysis", overall, detail))
 
 
 # ---------------------------------------------------------------------------
@@ -755,7 +962,8 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           font-size: 12px; font-weight: 600; }}
   .pill.pass, .pill.verified_real {{ background: #DBEFD9; color: var(--pass); }}
   .pill.fail, .pill.hallucinated   {{ background: #FDE3E3; color: var(--fail); }}
-  .pill.warn, .pill.unparseable, .pill.skipped {{ background: #FBF1D5; color: var(--warn); }}
+  .pill.warn, .pill.unparseable, .pill.skipped,
+  .pill.api_error {{ background: #FBF1D5; color: var(--warn); }}
   .pill.info {{ background: #DBE7F0; color: var(--blue); }}
   .callout {{ background: #FCF0C8; border-left: 4px solid var(--warn);
              padding: 14px 18px; margin: 18px 0; font-style: italic;
@@ -863,6 +1071,7 @@ VERDICT_LABEL = {
     "hallucinated":  "🚨 hallucinated",
     "unparseable":   "⚠️ unparseable",
     "skipped":       "⏸ skipped",
+    "api_error":     "⚠️ api error",
 }
 
 
@@ -1005,12 +1214,17 @@ def render_html(report: Report, out_path: Path) -> None:
     hallucinated_class = "stat bad" if analysis.hallucinated > 0 else "stat good"
     stat_blocks: list[str] = [
         f'<div class="stat"><div class="num">{analysis.total_citations}</div>'
-        '<div class="label">citations parsed</div></div>',
+        '<div class="label">unique citations</div></div>',
         f'<div class="stat good"><div class="num">{analysis.verified}</div>'
         '<div class="label">verified</div></div>',
         f'<div class="{hallucinated_class}"><div class="num">{analysis.hallucinated}</div>'
         '<div class="label">hallucinated</div></div>',
     ]
+    if analysis.api_errors:
+        stat_blocks.append(
+            f'<div class="stat"><div class="num">{analysis.api_errors}</div>'
+            '<div class="label">api errors</div></div>'
+        )
     stat_boxes = "\n".join(stat_blocks)
 
     # ---- System health table ----
@@ -1059,8 +1273,15 @@ def render_html(report: Report, out_path: Path) -> None:
             detail_html = "no CourtListener match"
         elif case.verdict == "skipped":
             detail_html = "no network"
+        elif case.verdict == "api_error":
+            reason = (case.notes[0] if case.notes else "API error")[:90]
+            detail_html = html_escape(reason)
         else:
             detail_html = "—"
+        if case.occurrences_in_memo > 1:
+            detail_html += (
+                f' <span class="meta">(cited ×{case.occurrences_in_memo} in memo)</span>'
+            )
         memo_rows_parts.append(
             _row([
                 str(i),
@@ -1074,9 +1295,11 @@ def render_html(report: Report, out_path: Path) -> None:
 
     memo_summary_meta = (
         f'<div class="meta">Memo: <code>{html_escape(analysis.memo_path)}</code> · '
-        f"{analysis.total_citations} full citations · "
+        f"{analysis.raw_citation_tokens or analysis.total_citations} raw tokens · "
+        f"{analysis.total_citations} unique · "
         f"{analysis.verified} verified · {analysis.hallucinated} hallucinated · "
         f"{analysis.unparseable} unparseable"
+        + (f" · {analysis.api_errors} api errors" if analysis.api_errors else "")
         + (f" · {analysis.skipped} skipped" if analysis.skipped else "")
         + "</div>"
     )
@@ -1121,6 +1344,7 @@ def print_memo_analysis_to_console(analysis: MemoAnalysis | None) -> None:
                 "hallucinated": "red",
                 "unparseable": "yellow",
                 "skipped": "yellow",
+                "api_error": "yellow",
             }.get(case.verdict, "white")
             t.add_row(
                 str(i),
@@ -1140,9 +1364,17 @@ def print_memo_analysis_to_console(analysis: MemoAnalysis | None) -> None:
         f"{analysis.hallucinated} hallucinated · "
         f"{analysis.unparseable} unparseable"
     )
+    if analysis.api_errors:
+        summary += f" · {analysis.api_errors} api_errors"
     if analysis.skipped:
         summary += f" · {analysis.skipped} skipped"
-    overall = "pass" if (analysis.hallucinated == 0 and analysis.unparseable == 0) else "warn"
+    overall = (
+        "pass"
+        if (analysis.hallucinated == 0
+            and analysis.unparseable == 0
+            and analysis.api_errors == 0)
+        else "warn"
+    )
     say(summary, overall)
 
     verified_cases = [c for c in analysis.cases if c.verdict == "verified_real"]
@@ -1219,6 +1451,10 @@ def main() -> int:
     parser.add_argument("--memo", type=Path, help="Path to a memo (.txt). Defaults to sample_memo.txt")
     parser.add_argument("--no-net", action="store_true", help="Skip all network calls")
     parser.add_argument("--quick", action="store_true", help="Skip slow practice-area stage")
+    parser.add_argument(
+        "--verbose", action="store_true",
+        help="Per-citation diagnostics: endpoint, HTTP status, retries, latency, verdict",
+    )
     args = parser.parse_args()
 
     import eyecite as _eyecite
@@ -1255,7 +1491,11 @@ def main() -> int:
 
     # Memo analysis (Eyecite parse + per-citation verdict + extraction)
     memo_path = args.memo if args.memo else Path("sample_memo.txt")
-    stage_memo_analysis(report, memo_path, do_network=not args.no_net)
+    stage_memo_analysis(
+        report, memo_path,
+        do_network=not args.no_net,
+        verbose=args.verbose,
+    )
 
     report.finished_at = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -1273,6 +1513,13 @@ def main() -> int:
             f"🚨 {analysis.hallucinated} hallucinated citation"
             f"{'s' if analysis.hallucinated != 1 else ''} found in memo",
             "fail",
+        )
+    if analysis and analysis.api_errors > 0:
+        say(
+            f"⚠️  {analysis.api_errors} citation"
+            f"{'s' if analysis.api_errors != 1 else ''} hit an API error "
+            "(distinct from hallucinations; re-run to confirm)",
+            "warn",
         )
     say(f"{passes} passed · {warns} warnings · {fails} failed",
         "pass" if fails == 0 else "fail")
