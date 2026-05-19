@@ -82,6 +82,18 @@ CL_BASE = "https://www.courtlistener.com/api/rest/v4"
 CL_TOKEN = os.environ.get("CL_TOKEN", "").strip()
 USER_AGENT = "juris-citation-verify/1.0 (+https://jurisconsultants.com)"
 
+# Pause between per-citation lookups in stage_memo_analysis. /citation-lookup/
+# is per-user rate-limited; cramming 36 calls into a few seconds gets us 429'd
+# even with retries. 1.5s gives the bucket time to drip.
+INTER_CITATION_PAUSE_S = 1.5
+
+# Per-status retry policy. 429 needs long, patient backoffs because CL's
+# rate-limit window is on the order of tens of seconds; 5xx are usually
+# transient hiccups that clear in a few seconds.
+RETRY_POLICY_429: dict[str, Any] = {"delays": [15.0, 30.0, 60.0], "max_attempts": 4}
+RETRY_POLICY_5XX: dict[str, Any] = {"delays": [2.0, 5.0, 10.0], "max_attempts": 3}
+RETRYABLE_5XX = {500, 502, 503, 504}
+
 # A realistic paralegal memo with a deliberate mix of:
 #  - real Supreme Court citations
 #  - a fabricated/hallucinated citation
@@ -250,10 +262,6 @@ def _headers() -> dict[str, str]:
     return h
 
 
-RETRYABLE_STATUSES = {429, 500, 502, 503, 504}
-RETRY_DELAYS = (1.0, 2.0, 4.0)   # seconds before each retry (jittered)
-
-
 def http(
     method: str,
     path: str,
@@ -263,17 +271,27 @@ def http(
 ) -> tuple[int, dict | str | None, float]:
     """Returns (status_code, parsed_body_or_text, total_latency_ms).
 
-    Retries up to 3 times with exponential backoff (≈1s, 2s, 4s ± jitter)
-    on HTTP 429 / 500 / 502 / 503 / 504. A transient blip used to mark a
-    real case as hallucinated forever; the retry budget makes verdicts
-    deterministic across runs.
+    Per-status retry policy:
+      - HTTP 429: up to 4 attempts (initial + 3 retries) at ≈15s, 30s, 60s
+        backoff (± 15% jitter). If the server sets a Retry-After header,
+        wait `max(Retry-After, scheduled)`.
+      - HTTP 500/502/503/504: up to 3 attempts at ≈2s, 5s backoff.
+      - Everything else: no retry.
+
+    The schedules differ because /citation-lookup/'s rate-limit window is
+    on the order of tens of seconds; impatient retries just compound the
+    problem. 5xx are usually transient hiccups that clear quickly.
     """
     url = path if path.startswith("http") else f"{CL_BASE}{path}"
     t_total = time.time()
     last_status: int = -1
     last_body: dict | str | None = None
+    last_retry_after: str | None = None
+    attempt = 0
 
-    for attempt in range(len(RETRY_DELAYS) + 1):  # 1 initial + 3 retries
+    while True:
+        attempt += 1
+        last_retry_after = None
         try:
             r = requests.request(method, url, headers=_headers(), timeout=45, **kw)
             try:
@@ -281,26 +299,46 @@ def http(
             except ValueError:
                 last_body = r.text
             last_status = r.status_code
+            last_retry_after = r.headers.get("Retry-After")
         except requests.RequestException as exc:
             last_status = -1
             last_body = str(exc)
 
-        if last_status not in RETRYABLE_STATUSES:
-            return last_status, last_body, (time.time() - t_total) * 1000
-        if attempt >= len(RETRY_DELAYS):
+        # Pick the policy for this status, or bail out if non-retryable.
+        if last_status == 429:
+            policy = RETRY_POLICY_429
+        elif last_status in RETRYABLE_5XX:
+            policy = RETRY_POLICY_5XX
+        else:
             return last_status, last_body, (time.time() - t_total) * 1000
 
-        delay = RETRY_DELAYS[attempt] * (0.85 + random.random() * 0.3)
+        if attempt >= policy["max_attempts"]:
+            return last_status, last_body, (time.time() - t_total) * 1000
+
+        # Scheduled backoff (attempt-1 maps to first delay).
+        scheduled = policy["delays"][attempt - 1] * (0.85 + random.random() * 0.3)
+
+        # On 429, honor Retry-After if the server set one (seconds only;
+        # CL doesn't use HTTP-date format here).
+        wait = scheduled
+        retry_after_note = ""
+        if last_status == 429 and last_retry_after:
+            try:
+                server_wait = float(last_retry_after)
+                if server_wait > scheduled:
+                    wait = server_wait
+                    retry_after_note = f" (Retry-After: {server_wait:.0f}s)"
+            except ValueError:
+                pass
+
         if verbose:
             say(
-                f"retry {attempt + 1}/{len(RETRY_DELAYS)}: HTTP {last_status} on "
-                f"{method} {path} — sleeping {delay:.2f}s",
+                f"retry {attempt}/{policy['max_attempts'] - 1}: "
+                f"HTTP {last_status} on {method} {path} — sleeping "
+                f"{wait:.1f}s{retry_after_note}",
                 "warn",
             )
-        time.sleep(delay)
-
-    # Unreachable; loop always returns.
-    return last_status, last_body, (time.time() - t_total) * 1000
+        time.sleep(wait)
 
 
 # ---------------------------------------------------------------------------
@@ -852,6 +890,17 @@ def stage_memo_analysis(
     for i, fc in enumerate(deduped, 1):
         key = _citation_key(fc)
         occurrences = occurrence_counts[key]
+
+        if verbose:
+            vol = fc.groups.get("volume", "") or ""
+            rep = fc.groups.get("reporter", "") or ""
+            pg = fc.groups.get("page", "") or ""
+            preview = f"{vol} {rep} {pg}".strip() or fc.matched_text()
+            if RICH:
+                console.print(f"  [dim][{i}/{total}] looking up {preview}…[/dim]")
+            else:
+                print(f"  [{i}/{total}] looking up {preview}...")
+
         t_call = time.time()
         case = extract_case(fc.matched_text(), eyecite_match=fc, verbose=verbose)
         case.occurrences_in_memo = occurrences
@@ -888,7 +937,7 @@ def stage_memo_analysis(
                 f"  [{i}] {case.queried_citation:22s} "
                 f"×{occurrences:<2d} {verdict_label:18s} {case.case_name or '—'}"
             )
-        time.sleep(0.2)
+        time.sleep(INTER_CITATION_PAUSE_S)
 
     if RICH:
         console.print(progress)
