@@ -514,11 +514,21 @@ def _normalize_cite_str(s: str) -> str:
 
 
 def _pick_cluster_from_search(cite_str: str, results: list[dict]) -> dict | None:
-    """Prefer a hit whose citation array contains an exact match for cite_str.
+    """Pick the cluster that IS the cited case, not one that merely cites it.
 
-    Search returns cases that *cite* the target as well as the target itself.
-    Without this, "576 U.S. 644" would match a Tennessee case that cites
-    Obergefell rather than Obergefell itself.
+    Why exact match on the `citation` array (not full-text relevance):
+        /search/ is a full-text index. A query for "576 U.S. 644" returns
+        thousands of hits — most are later cases that *cite* Obergefell in
+        their body. The `citation` field on a result, by contrast, lists
+        the citations the case is INDEXED UNDER. An exact match there
+        means "this result IS that case." Whitespace and case are
+        normalised so "576 U.S. 644" matches "576 U. S. 644".
+
+    Why sort by lowest cluster_id on ties:
+        Ties are rare and usually parallel-reporter duplicates left over
+        from a long-ago import. Lower cluster_ids were imported earlier
+        and are more likely to be the canonical entry; the duplicate
+        clusters tend to be sparser (missing opinions, missing docket).
     """
     if not results:
         return None
@@ -653,12 +663,76 @@ def _hydrate_docket(case: Case, cluster: dict, verbose: bool = False) -> None:
         case.court_id = court_field.get("id") or case.court_id
 
 
+FALLBACK_NOTE = "matched via /search/ fallback (likely parallel cite)"
+
+
+def _build_case_from_search_hit(canonical: str, match: dict) -> Case:
+    """Hydrate a Case from a /search/ result hit.
+
+    Shared between two paths that go through /search/:
+      (a) anonymous primary lookup (no CL_TOKEN)
+      (b) authenticated parallel-cite fallback (primary citation-lookup missed)
+    cluster_id is set so the caller can invoke _refine_from_cluster for
+    full enrichment when authenticated.
+    """
+    return Case(
+        queried_citation=canonical,
+        verdict="verified_real",
+        case_name=match.get("caseName") or match.get("caseNameFull") or "",
+        case_name_full=match.get("caseNameFull") or "",
+        citations=[c for c in (match.get("citation") or []) if c],
+        court=match.get("court") or "",
+        court_id=match.get("court_id") or "",
+        date_filed=match.get("dateFiled") or "",
+        date_argued=match.get("dateArgued") or "",
+        judges=match.get("judge") or "",
+        docket_number=match.get("docketNumber") or "",
+        absolute_url=match.get("absolute_url") or "",
+        cluster_id=match.get("cluster_id"),
+        auth_mode="authenticated" if CL_TOKEN else "anonymous",
+    )
+
+
+def _search_fallback(canonical: str, verbose: bool = False) -> dict | None:
+    """GET /search/ + _pick_cluster_from_search. Returns the matching
+    search-result dict, or None.
+
+    Why this exists as a fallback to /citation-lookup/:
+        CL stores cases under one or more "indexed citations." When you
+        POST /citation-lookup/ with a parallel form (e.g. the state-reporter
+        cite for a case primarily indexed under its Atlantic Reporter
+        cite), the endpoint sometimes returns no match even though the
+        cluster exists. /search/'s `citation`-array index has BOTH forms,
+        so an exact match here recovers the cluster.
+    """
+    code, body, ms = http(
+        "GET",
+        "/search/",
+        params={
+            "q": f'"{canonical}"',
+            "type": "o",
+            "order_by": "dateFiled asc",
+            "page_size": 50,
+        },
+        verbose=verbose,
+    )
+    if verbose:
+        say(
+            f"  GET /search/ (fallback) ← '{canonical}' → "
+            f"HTTP {code} ({ms:.0f} ms)",
+            "info",
+        )
+    if code != 200 or not isinstance(body, dict):
+        return None
+    return _pick_cluster_from_search(canonical, body.get("results") or [])
+
+
 def _extract_via_citation_lookup(canonical: str, verbose: bool = False) -> Case:
     """Primary path: POST /citation-lookup/ (auth-only, deterministic).
 
     Returns a Case whose verdict is one of:
-      - verified_real (cluster matched + populated)
-      - hallucinated  (per-citation status 404 / clusters empty)
+      - verified_real (cluster matched + populated, possibly via /search/ fallback)
+      - hallucinated  (BOTH primary citation-lookup AND fallback returned no match)
       - api_error     (HTTP non-200 after retries, or anomalous response shape)
     """
     code, body, ms = http(
@@ -691,10 +765,41 @@ def _extract_via_citation_lookup(canonical: str, verbose: bool = False) -> Case:
     per_status = entry.get("status", 200)
     clusters = entry.get("clusters") or []
 
-    # Per-citation 404 (or 200 with no clusters) = the citation is real-looking
-    # but resolves to nothing in CL's index. That's a hallucination.
+    # ------------------------------------------------------------------
+    # Parallel-cite fallback. A per-citation 404 (or 200 with no clusters)
+    # *might* be a real hallucination — but it's also the exact signature
+    # of a parallel-cite case where /citation-lookup/ couldn't resolve the
+    # cluster via the non-primary indexed form. /search/'s citation-array
+    # index has both forms; try it before declaring hallucination.
+    # If the fallback ALSO returns nothing, then and only then it's a
+    # hallucination. If the fallback hits an HTTP error, the existing
+    # retry machinery in http() handles it; final failure surfaces here
+    # as None and falls through to verdict=hallucinated, which is the
+    # safest interpretation when we've exhausted both paths.
+    # ------------------------------------------------------------------
     if per_status == 404 or (per_status == 200 and not clusters):
-        return Case(queried_citation=canonical, verdict="hallucinated")
+        if verbose:
+            say(
+                f"  primary /citation-lookup/ returned no match for "
+                f"'{canonical}' — trying /search/ fallback…",
+                "info",
+            )
+        match = _search_fallback(canonical, verbose=verbose)
+        if match is None:
+            if verbose:
+                say("  /search/ fallback also returned no match — hallucinated", "warn")
+            return Case(queried_citation=canonical, verdict="hallucinated")
+        case = _build_case_from_search_hit(canonical, match)
+        case.notes.append(FALLBACK_NOTE)
+        # Full authenticated enrichment via cluster endpoint.
+        _refine_from_cluster(case)
+        if verbose:
+            say(
+                f"  /search/ fallback recovered '{case.case_name}' "
+                f"(cluster {case.cluster_id})",
+                "pass",
+            )
+        return case
 
     # Per-citation status that is not 200 and not 404 is an API hiccup,
     # not a hallucination. Surface it distinctly.
@@ -720,9 +825,10 @@ def _extract_via_citation_lookup(canonical: str, verbose: bool = False) -> Case:
 
 
 def _extract_via_search(canonical: str, verbose: bool = False) -> Case:
-    """Fallback path for anonymous mode (no CL_TOKEN). /citation-lookup/
-    requires auth; /search/ does not. Less precise but still useful for
-    case-name + parallel-citation metadata."""
+    """Anonymous primary path (no CL_TOKEN). /citation-lookup/ requires
+    auth; /search/ does not. Less precise but still useful for case-name +
+    parallel-citation metadata. Authenticated runs use this same machinery
+    for the parallel-cite fallback in _extract_via_citation_lookup."""
     code, body, ms = http(
         "GET",
         "/search/",
@@ -747,22 +853,7 @@ def _extract_via_search(canonical: str, verbose: bool = False) -> Case:
     if match is None:
         return Case(queried_citation=canonical, verdict="hallucinated")
 
-    case = Case(
-        queried_citation=canonical,
-        verdict="verified_real",
-        case_name=match.get("caseName") or match.get("caseNameFull") or "",
-        case_name_full=match.get("caseNameFull") or "",
-        citations=[c for c in (match.get("citation") or []) if c],
-        court=match.get("court") or "",
-        court_id=match.get("court_id") or "",
-        date_filed=match.get("dateFiled") or "",
-        date_argued=match.get("dateArgued") or "",
-        judges=match.get("judge") or "",
-        docket_number=match.get("docketNumber") or "",
-        absolute_url=match.get("absolute_url") or "",
-        cluster_id=match.get("cluster_id"),
-        auth_mode="anonymous",
-    )
+    case = _build_case_from_search_hit(canonical, match)
     case.fields_missing_due_to_auth = ["full opinion text", "concurrences", "dissents"]
     case.notes.append(
         "Anonymous mode: lookup via /search/ (less precise than /citation-lookup/). "
@@ -1195,6 +1286,15 @@ def _render_case_card_html(case: Case, anchor: str) -> str:
             "<code>export CL_TOKEN=&lt;token&gt;</code>, then re-run.</div>"
         )
 
+    # Parallel-cite fallback notice — one-liner, warn palette.
+    fallback_callout = ""
+    if any(FALLBACK_NOTE in n for n in case.notes):
+        fallback_callout = (
+            '<div class="callout">Matched via <code>/search/</code> fallback '
+            "(parallel citation — CourtListener indexes this case under "
+            "another reporter form).</div>"
+        )
+
     syllabus_block = ""
     if case.syllabus:
         syllabus_block = (
@@ -1243,6 +1343,7 @@ def _render_case_card_html(case: Case, anchor: str) -> str:
         f'    <div class="court-line">{court_line}</div>\n'
         "  </div>\n"
         '  <div class="case-body">\n'
+        f"    {fallback_callout}\n"
         f"    <table class=\"info\">{info_rows}</table>\n"
         f"    {auth_callout}\n"
         f"    {syllabus_block}\n"
